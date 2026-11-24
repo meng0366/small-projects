@@ -99,3 +99,38 @@ def reset_logger() -> None:
             pass
         logger.removeHandler(handler)
     _logger = None
+
+
+def log_path() -> str:
+    """当前日志文件路径（命令行 `logs` 子命令要显示它）。"""
+    return os.path.join(LOG_DIR, "agent.jsonl")
+
+
+def read_runs(limit: int = 10, failed_only: bool = False,
+              path: str = None) -> list:
+    """读取最近的运行记录，供 `python -m app.cli logs` 展示。
+
+    - 坏行（截断、手工编辑）直接跳过，不能因为一行脏数据就看不了日志；
+    - 倒着读再反转，避免把整个文件读进内存（日志会轮转，但单文件仍可能几 MB）。
+    """
+    path = path or log_path()
+    if not os.path.exists(path):
+        return []
+
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if failed_only and record.get("ok"):
+                continue
+            rows.append(record)
+
+    return rows[-limit:] if limit else rows
