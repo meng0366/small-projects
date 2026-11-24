@@ -30,6 +30,7 @@ class AgentState(TypedDict, total=False):
     # ---- 生成与执行 ----
     statement: str                   # 生成的 SQL 或 Python 代码
     statements: List[str]            # 历次生成的语句（判断"重试是否真的改过"，P0-1b）
+    lessons_used: List[str]          # 本次注入了哪几条修正记录（P1-1，便于排查"为什么这次答对了"）
     result: Any                      # 执行结果（DataFrame）
 
     # ---- 错误与重试 ----

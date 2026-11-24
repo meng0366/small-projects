@@ -51,7 +51,7 @@ class TestGraphFlow(unittest.TestCase):
         """第二次生成必须带上一次的错误信息（错误回喂）。"""
         received = []
 
-        def flaky(schema, terms, question, previous_error=None, previous_empty=False):
+        def flaky(schema, terms, question, previous_error=None, previous_empty=False, lessons=None):
             received.append(previous_error)
             return BAD_CODE if len(received) == 1 else GOOD_CODE
 
@@ -74,7 +74,7 @@ class TestGraphFlow(unittest.TestCase):
         """SQL 执行成功但 0 行时，应触发一次自愈；放宽后拿到数据就正常回答。"""
         received_empty = []
 
-        def flaky_sql(schema, terms, question, previous_error=None, previous_empty=False):
+        def flaky_sql(schema, terms, question, previous_error=None, previous_empty=False, lessons=None):
             received_empty.append(previous_empty)
             # 第一次故意给一个语法正确但必然查不到数据的 SQL，第二次给正常 SQL
             return ("SELECT * FROM orders WHERE amount < 0" if len(received_empty) == 1
@@ -160,7 +160,7 @@ class TestGraphFlow(unittest.TestCase):
         import pandas as pd
         calls = []
 
-        def counting_sql(schema, terms, question, previous_error=None, previous_empty=False):
+        def counting_sql(schema, terms, question, previous_error=None, previous_empty=False, lessons=None):
             calls.append(question)
             return "SELECT SUM(amount) FROM orders WHERE order_date < '2024-01-01'"
 

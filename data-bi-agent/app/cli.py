@@ -12,6 +12,8 @@
     python -m app.cli chat --list-sessions # 列出本地会话
     python -m app.cli schema               # 看数据源、表结构、字段释义、指标口径
     python -m app.cli logs -n 5 --failed   # 看最近 5 条失败的运行记录
+    python -m app.cli teach "问题" --sql "SELECT ..."   # 把答错的问题教成 few-shot
+    python -m app.cli lessons              # 查看 / 删除已沉淀的修正记录
 
 设计取舍（借鉴来源见 docs/参考项目记录.md 第 7–9 节）：
 - **只用标准库 argparse**：项目已经带了 LangChain 一大串依赖，CLI 层不再引入
@@ -44,6 +46,16 @@ from app.render import (
 )
 from app.schema.loader import list_tables, load_catalog
 from app.tools.chart_tool import CHART_TYPE_LABEL
+from app.tools.lesson_store import (
+    LessonError,
+    add_lesson,
+    db_fingerprint,
+    lessons_path,
+    load_lessons,
+    remove_lesson,
+    score_lesson,
+    select_lessons,
+)
 from app.tools.suggest_tool import suggest_followups
 
 # Windows 控制台默认可能是 GBK，强制 UTF-8 输出，避免中文打印报 UnicodeEncodeError
@@ -52,10 +64,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.6.0"
-"""与项目阶段对齐：阶段 6 是计划外增强（CLI 子命令、会话续聊、追问建议）。"""
+VERSION = "0.7.0"
+"""与项目阶段对齐：阶段 6 是计划外增强（CLI 子命令、会话续聊、追问建议）；
+0.7 是改进清单 P1（修正回流 teach/lessons）。"""
 
-SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l", "version", "help")
+SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
+               "teach", "t", "lessons", "ls", "version", "help")
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
 ROUTE_LABEL = {
@@ -78,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m app.cli chat -c\n"
             "  python -m app.cli schema\n"
             "  python -m app.cli logs -n 5 --failed\n"
+            "  python -m app.cli teach \"各城市的销售额是多少？\" --sql \"SELECT ...\"\n"
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -117,6 +132,23 @@ def build_parser() -> argparse.ArgumentParser:
     logs_cmd.add_argument("-n", type=int, default=10, metavar="N", help="显示最近 N 条（默认 10）")
     logs_cmd.add_argument("--failed", action="store_true", help="只看失败的记录")
     logs_cmd.add_argument("--json", action="store_true", help="以 JSON 输出")
+
+    teach = sub.add_parser("teach", aliases=["t"],
+                           help="把「问题 → 正确 SQL」存成 few-shot（修正回流）")
+    teach.add_argument("question", help="答错的那个问题（原话）")
+    teach.add_argument("-s", "--sql", dest="sql", required=True, metavar="SQL",
+                       help="正确的 SQL；若这类问题该拒答，写 DEFER: 原因")
+    teach.add_argument("-n", "--note", default="", help="备注：为什么这么改（只在本地展示）")
+    teach.add_argument("--force", action="store_true",
+                       help="跳过\"SQL 能否执行\"的校验（不推荐，存进去会教模型写错语句）")
+    teach.add_argument("--db", metavar="PATH", help="使用指定的 SQLite 库文件")
+
+    lessons = sub.add_parser("lessons", aliases=["ls"], help="查看/删除已沉淀的修正记录")
+    lessons.add_argument("--rm", metavar="ID", help="删除指定 id 的记录")
+    lessons.add_argument("--match", metavar="QUESTION",
+                         help="看某个问题会命中哪几条记录（调试相关度用）")
+    lessons.add_argument("--json", action="store_true", help="以 JSON 输出")
+    lessons.add_argument("--db", metavar="PATH", help="使用指定的 SQLite 库文件")
 
     sub.add_parser("version", help="显示版本与当前数据源")
 
@@ -536,12 +568,102 @@ def run_logs(args) -> int:
     return EXIT_OK
 
 
+def run_teach(args) -> int:
+    """把一条「问题 → 正确 SQL」存成 few-shot（P1-1 修正回流）。
+
+    为什么要先跑一遍 SQL：lesson 会被当成"可信上下文"拼进 Prompt，
+    一条跑不通的语句等于教模型写错语句。默认验证，`--force` 才放行。
+    """
+    question = resolve_question(args.question)
+    if not question:
+        print("请提供答错的那个问题，例如：\n"
+              "  python -m app.cli teach \"各城市的销售额是多少？\" "
+              "--sql \"SELECT ...\"", file=sys.stderr)
+        return EXIT_USAGE
+
+    ctx = make_context(args)
+    try:
+        lesson = add_lesson(question, args.sql, note=args.note or "",
+                            ctx=ctx, verify=not args.force)
+    except LessonError as e:
+        print(f"[拒绝入库] {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    total = len(load_lessons(ctx))
+    print(f"已存入 {lesson['id']}（{'该拒答示范' if lesson['kind'] == 'defer' else '正确 SQL'}）")
+    print(f"  问题：{lesson['question']}")
+    print(f"  输出：{lesson['output'].splitlines()[0][:80]}")
+    print(f"\n当前库共 {total} 条修正记录：{lessons_path(ctx)}")
+    print("下次问到相似问题时会自动作为 few-shot 注入；不想生效可用 `lessons --rm` 删除。")
+    return EXIT_OK
+
+
+def run_lessons(args) -> int:
+    """列出 / 删除 / 试算命中：修正记录的可解释入口。"""
+    ctx = make_context(args)
+
+    if args.rm:
+        if remove_lesson(args.rm, ctx):
+            print(f"已删除 {args.rm}。")
+            return EXIT_OK
+        print(f"没有找到 id 为 {args.rm} 的记录；用 `python -m app.cli lessons` 查看全部。",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    items = load_lessons(ctx)
+
+    if args.match:
+        picked = select_lessons(args.match, items, ctx.enums, ctx.terms_dict)
+        if args.json:
+            print(json.dumps({"question": args.match,
+                              "matched": [{"id": i.get("id"), "score": score_lesson(
+                                  args.match, i, ctx.enums, ctx.terms_dict)} for i in picked]},
+                             ensure_ascii=False, indent=2))
+            return EXIT_OK
+        print(f"问题：{args.match}")
+        if not picked:
+            print("不会注入任何记录（没有足够相关的；无关示范会带偏模型，宁可不用）。")
+            return EXIT_OK
+        print(f"会注入 {len(picked)} 条（按相关度降序）：")
+        for item in picked:
+            score = score_lesson(args.match, item, ctx.enums, ctx.terms_dict)
+            print(f"  · {item.get('id')}  相关度 {score:.2f}  {item.get('question', '')[:50]}")
+        return EXIT_OK
+
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    if not items:
+        print("还没有修正记录。\n"
+              "发现答错时这样教它：\n"
+              "  python -m app.cli teach \"那个问题\" --sql \"正确的 SQL\" -n \"为什么这么改\"\n"
+              "如果这类问题该拒答：--sql \"DEFER: 缺少成本字段\"")
+        return EXIT_OK
+
+    print(f"修正记录（{len(items)} 条）· 库指纹 {db_fingerprint(ctx)}")
+    print(f"文件：{lessons_path(ctx)}\n")
+    for item in items:
+        kind = "拒答" if item.get("kind") == "defer" else "SQL"
+        print(f"· {item.get('id')}  [{kind}]  {item.get('question', '')}")
+        first = (item.get("output") or "").splitlines()
+        if first:
+            print(f"    → {first[0][:90]}")
+        if item.get("note"):
+            print(f"    备注：{item['note']}")
+        print(f"    {item.get('created', '')}"
+              f"{'  更新于 ' + item['updated'] if item.get('updated') else ''}")
+    print("\n删除：python -m app.cli lessons --rm L001"
+          "   看某问题会命中哪几条：--match \"问题\"")
+    return EXIT_OK
+
+
 def run_version() -> int:
     ctx = AgentContext()
     print(f"数据分析 Agent v{VERSION}")
     print(f"模型：{LLM_MODEL}")
     print(f"数据源：{ctx.mode_label}")
-    print("命令：ask / chat / schema / logs / version（-h 查看用法）")
+    print("命令：ask / chat / schema / logs / teach / lessons / version（-h 查看用法）")
     return EXIT_OK
 
 
@@ -566,6 +688,10 @@ def main(argv: Optional[list] = None) -> int:
         return run_schema(args)
     if command in ("logs", "l"):
         return run_logs(args)
+    if command in ("teach", "t"):
+        return run_teach(args)
+    if command in ("lessons", "ls"):
+        return run_lessons(args)
     if command == "version":
         return run_version()
     parser.print_help()

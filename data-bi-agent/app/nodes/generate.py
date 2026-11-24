@@ -3,10 +3,12 @@
 对应功能：
 - F2.1 Text-to-Pandas 代码生成
 - F2.3 Text-to-SQL 生成
+- F2.7 修正回流（把人工修正过的问答作为 few-shot 注入，P1-1）
 
 借鉴点：
 - PandasAI 的 code_generation 模块：用 schema + few-shot 生成代码，且不发送整表数据；
-- OpenChatBI 的 schema 关联：把业务术语注入 Prompt，减少口径误解。
+- OpenChatBI 的 schema 关联：把业务术语注入 Prompt，减少口径误解；
+- Datus-agent 的 correction 回流：人工修正过的问答要沉淀下来，而不是只解决一次。
 """
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -16,6 +18,7 @@ from app.prompts.templates import (
     ERROR_FEEDBACK_TEMPLATE,
     FEW_SHOT_EXAMPLES,
     FEW_SHOT_SQL,
+    LESSON_PREAMBLE,
     SQL_USER_TEMPLATE,
     SYSTEM_ANALYST,
     SYSTEM_SQL,
@@ -26,19 +29,33 @@ from app.prompts.templates import (
 def _build_messages(system: str, examples: list, user_template: str,
                     schema_info: str, terms: str, question: str,
                     previous_error: str = None, kind: str = "SQL",
-                    previous_empty: bool = False) -> list:
+                    previous_empty: bool = False, lessons: list = None) -> list:
     """构造带 few-shot 的消息列表；重试时追加反馈消息。
 
     previous_empty 与 previous_error 是两种不同的失败：
     - 报错：语法 / 字段名错了，按错误信息修正；
     - 空结果：执行成功但 0 行，通常是条件过严或枚举值写错，要放宽条件。
     用同一句"执行失败"提示会误导模型去修语法，所以分两套模板。
+
+    lessons 是修正回流（P1-1）：排在通用示例**之后**、当前问题**之前**。
+    越靠近当前问题影响力越大，而它本来就是"这个问题该怎么写"的示范。
+    第一条 lesson 前面还要加一句"已确认口径"——实测光给示例，模型仍会以
+    "这个词没有定义"为由拒答，必须明说这条写法本身就是定义。
     """
     messages = [SystemMessage(content=system)]
-    for q, output in examples:
+
+    pairs = list(examples or [])
+    for q, output in pairs:
         messages.append(HumanMessage(
             content=user_template.format(schema=schema_info, terms=terms, question=q)))
         messages.append(AIMessage(content=output))
+
+    for index, item in enumerate(lessons or []):
+        prefix = LESSON_PREAMBLE if index == 0 else ""
+        messages.append(HumanMessage(content=prefix + user_template.format(
+            schema=schema_info, terms=terms, question=item.get("question", ""))))
+        messages.append(AIMessage(content=item.get("output", "")))
+
     messages.append(HumanMessage(
         content=user_template.format(schema=schema_info, terms=terms, question=question)))
 
@@ -51,22 +68,24 @@ def _build_messages(system: str, examples: list, user_template: str,
 
 
 def generate_code(schema_info: str, terms: str, question: str,
-                  previous_error: str = None, previous_empty: bool = False) -> str:
+                  previous_error: str = None, previous_empty: bool = False,
+                  lessons: list = None) -> str:
     """根据问题 + schema + 术语生成 pandas 代码。"""
     messages = _build_messages(SYSTEM_ANALYST, FEW_SHOT_EXAMPLES, USER_TEMPLATE,
                                schema_info, terms, question,
                                previous_error, kind="Python 代码",
-                               previous_empty=previous_empty)
+                               previous_empty=previous_empty, lessons=lessons)
     resp = get_llm().invoke(messages)
     return strip_code_fence(resp.content)
 
 
 def generate_sql(schema_info: str, terms: str, question: str,
-                 previous_error: str = None, previous_empty: bool = False) -> str:
+                 previous_error: str = None, previous_empty: bool = False,
+                 lessons: list = None) -> str:
     """根据问题 + 数据库 schema + 术语生成 SQL 语句（F2.3）。"""
     messages = _build_messages(SYSTEM_SQL, FEW_SHOT_SQL, SQL_USER_TEMPLATE,
                                schema_info, terms, question,
                                previous_error, kind="SQL",
-                               previous_empty=previous_empty)
+                               previous_empty=previous_empty, lessons=lessons)
     resp = get_llm().invoke(messages)
     return strip_code_fence(resp.content)

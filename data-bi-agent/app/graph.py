@@ -39,13 +39,19 @@ from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
 from app.tools.enum_guard import build_clarify_answer
+from app.tools.lesson_store import select_lessons
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
 
 def make_generate_node(ctx: AgentContext):
-    """生成节点：按当前路由产出 SQL 或 pandas 代码，重试时带上上次错误。"""
+    """生成节点：按当前路由产出 SQL 或 pandas 代码，重试时带上上次错误。
+
+    生成前会挑出**与本问题相关**的修正记录（P1-1）作为 few-shot：
+    用户 teach 的"这类问题该怎么写 / 这类问题该拒答"，比通用示例更贴近当前问题。
+    挑不到相关的就一条都不注入——无关的示范会把模型带偏。
+    """
 
     def node(state: AgentState) -> dict:
         question = state.get("rewritten_question") or state.get("question", "")
@@ -56,19 +62,28 @@ def make_generate_node(ctx: AgentContext):
         # 空结果之后再报错时，必须切回报错模板。
         previous_empty = bool(state.get("empty_result"))
 
+        lessons = []
+        if ctx.use_lessons:
+            try:
+                lessons = select_lessons(question, ctx.lessons, ctx.enums, ctx.terms_dict)
+            except Exception:
+                lessons = []      # 沉淀层出问题不能影响问答本身
+        used = [item.get("id", "") for item in lessons]
+
         try:
             if route == "sql":
                 statement = generate_sql(state.get("schema_info", ""), state.get("terms", ""),
                                          question, previous_error=previous_error,
-                                         previous_empty=previous_empty)
+                                         previous_empty=previous_empty, lessons=lessons)
             else:
                 statement = generate_code(state.get("schema_info", ""), state.get("terms", ""),
                                           question, previous_error=previous_error,
-                                          previous_empty=previous_empty)
+                                          previous_empty=previous_empty, lessons=lessons)
         except Exception as e:
-            return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}"}
+            return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}",
+                    "lessons_used": used}
 
-        return {"statement": statement}
+        return {"statement": statement, "lessons_used": used}
 
     return node
 
@@ -384,6 +399,7 @@ class GraphAgent:
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),
             empty=is_empty_result(result) or is_aggregate_empty(result),
+            lessons=len(state.get("lessons_used") or []),
             chart=state.get("chart_type", ""),
             elapsed=round(time.perf_counter() - started, 2),
             question=raw_question[:200],

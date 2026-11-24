@@ -24,6 +24,8 @@ from app.schema.loader import (
     load_catalog_terms,
     load_dataframe,
 )
+from app.tools.lesson_store import known_words as lesson_known_words
+from app.tools.lesson_store import load_lessons
 
 
 @dataclass
@@ -32,6 +34,7 @@ class AgentContext:
     db_name: str = DEFAULT_DB
     csv_name: str = "sales_orders.csv"
     db_file: Optional[str] = None    # 命令行 `--db` 指定的库文件，优先于 data/ 下的默认库
+    use_lessons: bool = True         # 是否加载修正回流（few-shot）；评测基线用 False 保证可比
 
     @cached_property
     def db_path(self) -> Optional[str]:
@@ -73,6 +76,31 @@ class AgentContext:
     @cached_property
     def catalog(self) -> dict:
         return load_catalog()
+
+    @cached_property
+    def lessons(self) -> list:
+        """已沉淀的修正记录（P1-1），按当前库指纹隔离。
+
+        只加载不挑选：挑哪几条要看具体问题，属于生成节点的职责
+        （`select_lessons`）。这里做缓存是因为一次问答里可能重试多次，
+        每次都读盘没必要。
+        """
+        if not self.use_lessons:
+            return []
+        return load_lessons(self)
+
+    @cached_property
+    def terms_dict(self) -> dict:
+        """业务术语表本身（不是格式化后的文本），供相关度判断区分"库内词/库外词"。"""
+        return self.catalog.get("terms") or {}
+
+    @cached_property
+    def known_words(self) -> set:
+        """库内已知的业务词（术语名 + 字段标签 + 枚举取值）。
+
+        不在其中的实义词说明是用户自定义口径（如"大单"），只能靠修正记录传下去。
+        """
+        return lesson_known_words(self.enums, self.terms_dict)
 
     @cached_property
     def df(self) -> pd.DataFrame:

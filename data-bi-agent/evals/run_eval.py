@@ -44,6 +44,7 @@ if str(ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from app.config import LLM_MODEL  # noqa: E402
+from app.context import AgentContext  # noqa: E402
 from app.graph import GraphAgent  # noqa: E402
 from app.logging_utils import TokenCounter  # noqa: E402
 from app.tools.sql_tool import run_sql  # noqa: E402
@@ -404,6 +405,8 @@ def main() -> None:
     parser.add_argument("--max-retries", type=int, default=2, help="最大重试次数，默认 2")
     parser.add_argument("--tag", default="", help="报告文件名后缀，便于区分多次运行")
     parser.add_argument("--out-dir", default="", help="报告输出目录，默认 evals/reports")
+    parser.add_argument("--with-lessons", action="store_true",
+                        help="启用修正回流（few-shot）；默认关闭，基线以冷启动口径比较")
     args = parser.parse_args()
 
     global REPORT_DIR
@@ -411,7 +414,11 @@ def main() -> None:
         REPORT_DIR = Path(args.out_dir).resolve()
 
     cases = select_cases(load_cases(), args)
-    agent = GraphAgent(with_chart=args.with_chart, with_insight=args.with_insight,
+    # 默认**不带**修正记录（use_lessons=False）：基线要反映冷启动表现。
+    # 一旦沉淀了 lesson 就自动变好，历史数字就再也比不了 —— 想测"沉淀之后有多好"
+    # 就显式加 --with-lessons，那属于另一个口径。
+    ctx = AgentContext(use_lessons=args.with_lessons)
+    agent = GraphAgent(ctx, with_chart=args.with_chart, with_insight=args.with_insight,
                        max_retries=args.max_retries)
 
     if args.dry_run:
