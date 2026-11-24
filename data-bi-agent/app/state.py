@@ -35,6 +35,8 @@ class AgentState(TypedDict, total=False):
     errors: List[str]                # 历史错误（供反思与排查）
     retry_count: int                 # 已重试次数
     max_retries: int                 # 最大重试次数
+    empty_result: bool               # 本次结果是否为空（0 行）——执行成功但没查到数据
+    empty_retried: bool              # 是否已因空结果重试过（只给一次机会，避免空转）
 
     # ---- 输出 ----
     insight: str                     # 洞察文案

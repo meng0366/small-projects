@@ -227,7 +227,11 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
         print(statement)
 
     print(f"\n[分析结果]（{len(df)} 行）")
-    print(render(df, "table"))
+    if len(df) == 0:
+        # 空表打印"Empty DataFrame…"对用户没意义，直接说明没有数据
+        print("（当前条件下没有匹配的数据行）")
+    else:
+        print(render(df, "table"))
 
     chart_path = state.get("chart_path") or ""
     chart_type = state.get("chart_type") or "none"

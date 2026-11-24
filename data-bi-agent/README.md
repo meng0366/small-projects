@@ -304,7 +304,7 @@ evals/
 └── reports/             # 评测报告（仅 baseline 入库，临时报告已忽略）
 tests/
 ├── test_smoke.py        # 离线冒烟测试（34 个用例）
-├── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
+├── test_graph.py        # 状态机与重试测试（9 个用例，全 mock LLM）
 ├── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（22 个用例）
 ├── test_security.py     # 安全防护测试（16 个用例）
@@ -325,8 +325,10 @@ generate：生成 SQL 或 pandas 代码（重试时带上一次的真实报错�
  ↓
 execute：SQL 走只读库 / 代码走受限命名空间
  ↓
-  ├─ 成功 ─→ answer：规则选图（Plotly HTML）+ 统计分析 → 中文洞察
-  └─ 失败 ─→ reflect：记录错误、SQL 失败则换 pandas → 回到 generate（最多 2 次）
+  ├─ 成功且有数据 ─→ answer：规则选图（Plotly HTML）+ 统计分析 → 中文洞察
+  ├─ 成功但 0 行 ─→ reflect：不换路，只提示"放宽条件 / 核对枚举值"重写一次
+  │                   → 仍为空则如实说明"没有匹配数据"，不空转、不编结论
+  └─ 失败 ────────→ reflect：记录错误、SQL 失败则换 pandas → 回到 generate（最多 2 次）
 ```
 
 ## 安全说明（重要）
@@ -367,12 +369,12 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 141 个用例，覆盖：
+共 145 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
 | `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
-| `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级（全部 mock LLM） |
+| `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级、空结果自愈与如实说明（全部 mock LLM） |
 | `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递、追问建议按钮（全部 mock LLM） |
 | `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容） |
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |

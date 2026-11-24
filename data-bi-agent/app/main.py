@@ -168,21 +168,25 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
         meta.append(f"自动重试 {msg['retry']} 次后完成")
     st.caption("　|　".join(m for m in meta if m))
 
-    if show_chart:
-        fig, chart_type = build_chart(df, question)
-        if fig is not None:
-            st.plotly_chart(fig, width="stretch")
-            st.caption(f"图表类型：{CHART_TYPE_LABEL.get(chart_type, chart_type)}")
+    if len(df) == 0:
+        # 空结果不画空图、不给空表，直接说明（洞察文案里已写清原因与建议）
+        st.info("当前条件下没有匹配的数据行。")
+    else:
+        if show_chart:
+            fig, chart_type = build_chart(df, question)
+            if fig is not None:
+                st.plotly_chart(fig, width="stretch")
+                st.caption(f"图表类型：{CHART_TYPE_LABEL.get(chart_type, chart_type)}")
 
-    st.dataframe(df, width="stretch",
-                 height=min(420, 42 + 35 * min(len(df), 10)))
-    st.download_button(
-        "下载结果 CSV",
-        data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="result.csv",
-        mime="text/csv",
-        key=f"dl_{msg.get('question', '')}_{len(df)}",
-    )
+        st.dataframe(df, width="stretch",
+                     height=min(420, 42 + 35 * min(len(df), 10)))
+        st.download_button(
+            "下载结果 CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="result.csv",
+            mime="text/csv",
+            key=f"dl_{msg.get('question', '')}_{len(df)}",
+        )
 
     if show_code and msg.get("statement"):
         label = "SQL" if msg.get("route") == "sql" else "Python"

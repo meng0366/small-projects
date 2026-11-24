@@ -27,7 +27,13 @@ from app.logging_utils import TokenCounter, log_run
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_code, generate_sql
-from app.nodes.reflect import DEFAULT_MAX_RETRIES, make_reflect_node, route_after_execute
+from app.nodes.reflect import (
+    EMPTY_RESULT_NOTE,
+    DEFAULT_MAX_RETRIES,
+    is_empty_result,
+    make_reflect_node,
+    route_after_execute,
+)
 from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
@@ -42,14 +48,20 @@ def make_generate_node(ctx: AgentContext):
         question = state.get("rewritten_question") or state.get("question", "")
         route = state.get("route", "sql")
         previous_error = state.get("error") or None
+        # 空结果与报错要分开提示：空结果让模型"放宽条件"，报错让模型"修语法"。
+        # 用「上一轮执行结果是否为空」判断，而不是「是否重试过」——
+        # 空结果之后再报错时，必须切回报错模板。
+        previous_empty = bool(state.get("empty_result"))
 
         try:
             if route == "sql":
                 statement = generate_sql(state.get("schema_info", ""), state.get("terms", ""),
-                                         question, previous_error=previous_error)
+                                         question, previous_error=previous_error,
+                                         previous_empty=previous_empty)
             else:
                 statement = generate_code(state.get("schema_info", ""), state.get("terms", ""),
-                                          question, previous_error=previous_error)
+                                          question, previous_error=previous_error,
+                                          previous_empty=previous_empty)
         except Exception as e:
             return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}"}
 
@@ -69,13 +81,18 @@ def make_execute_node(ctx: AgentContext):
         if state.get("route") == "sql" and ctx.has_db:
             r = run_sql(statement, ctx.db_path)
             if r["ok"]:
-                return {"result": r["df"], "error": None}
-            return {"result": None, "error": f"SQL {r['stage']} 阶段：{r['error']}"}
+                empty = is_empty_result(r["df"])
+                return {"result": r["df"], "error": None, "empty_result": empty}
+            return {"result": None, "error": f"SQL {r['stage']} 阶段：{r['error']}",
+                    "empty_result": False}
 
         r = execute_code(statement, ctx.df)
         if r["ok"]:
-            return {"result": to_frame(r["result"]), "error": None}
-        return {"result": None, "error": f"代码 {r['stage']} 阶段：{r['error']}"}
+            frame = to_frame(r["result"])
+            empty = is_empty_result(frame)
+            return {"result": frame, "error": None, "empty_result": empty}
+        return {"result": None, "error": f"代码 {r['stage']} 阶段：{r['error']}",
+                "empty_result": False}
 
     return node
 
@@ -96,6 +113,20 @@ def make_answer_node(ctx: AgentContext, with_chart: bool = True,
             if errors:
                 answer += f"（共尝试 {len(errors)} 次）"
             return {"insight": "", "answer": answer, "chart_type": "none", "chart_path": ""}
+
+        # 空结果：执行成功但没数据。已经自动重试过一次（放宽条件）仍为空，
+        # 就如实说明，不再让模型"编"一段洞察 —— 空表没什么可洞察的，还容易胡编。
+        if is_empty_result(result):
+            retried = bool(state.get("empty_retried"))
+            answer = "查询已执行成功，但当前条件下没有匹配到数据。"
+            answer += ("已自动尝试放宽条件重查一次，仍为空；"
+                       if retried else "")
+            answer += ("可能原因：筛选条件过严或条件叠加后无交集、"
+                       "地区/品类/客户等级等取值与库中写法不一致、"
+                       "或所问时间段超出数据覆盖范围（本库为 2025 年数据）。"
+                       "可以换个时间段或减少筛选条件再问。")
+            return {"insight": answer, "answer": answer,
+                    "chart_type": "none", "chart_path": ""}
 
         question = state.get("rewritten_question") or state.get("question", "")
         update = {}
@@ -208,6 +239,7 @@ class GraphAgent:
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),
+            empty=is_empty_result(result),
             chart=state.get("chart_type", ""),
             elapsed=round(time.perf_counter() - started, 2),
             question=raw_question[:200],
