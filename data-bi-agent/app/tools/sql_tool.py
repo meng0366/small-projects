@@ -9,9 +9,11 @@
 """
 import re
 import sqlite3
+import time
 
 import pandas as pd
 
+from app.config import SQL_TIMEOUT_SECONDS
 from app.schema.loader import get_db_path
 
 # 修改类或危险类关键字：命中即拒绝（SQLite 的 WITH ... DELETE 也算）
@@ -62,26 +64,45 @@ def connect_readonly(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 
 
-def run_sql(sql: str, db_path: str = None, max_rows: int = MAX_ROWS_DEFAULT) -> dict:
+def run_sql(sql: str, db_path: str = None, max_rows: int = MAX_ROWS_DEFAULT,
+            timeout: float = None) -> dict:
     """执行 SQL 并返回 DataFrame。
 
     返回：{ok, df, sql, rows, truncated, error, stage}
+
+    timeout：查询超时（秒）。SQLite 没有原生的语句超时，这里用 progress handler
+    按"每执行 2000 条虚拟机指令回调一次"的方式检查是否超时，超时即中断查询——
+    挡住误写的笛卡尔积这类把 CPU 打满的 SQL。
     """
     db_path = db_path or get_db_path()
+    timeout = SQL_TIMEOUT_SECONDS if timeout is None else timeout
 
     try:
         safe_sql = check_sql_safety(sql)
     except UnsafeSQLError as e:
         return {"ok": False, "stage": "safety", "error": str(e), "sql": sql, "df": None}
 
+    deadline = time.monotonic() + timeout
+
+    def _guard() -> int:
+        return 1 if time.monotonic() > deadline else 0
+
     try:
         con = connect_readonly(db_path)
         try:
+            con.set_progress_handler(_guard, 2000)
             cur = con.execute(safe_sql)
             fetched = cur.fetchmany(max_rows + 1)
             columns = [d[0] for d in cur.description] if cur.description else []
         finally:
             con.close()
+    except sqlite3.OperationalError as e:
+        if "interrupt" in str(e).lower():
+            return {"ok": False, "stage": "timeout",
+                    "error": f"查询超过 {timeout:g} 秒已中止（SQL 可能写成了大笛卡尔积）",
+                    "sql": safe_sql, "df": None}
+        return {"ok": False, "stage": "runtime", "error": f"{type(e).__name__}: {e}",
+                "sql": safe_sql, "df": None}
     except Exception as e:
         return {"ok": False, "stage": "runtime", "error": f"{type(e).__name__}: {e}",
                 "sql": safe_sql, "df": None}

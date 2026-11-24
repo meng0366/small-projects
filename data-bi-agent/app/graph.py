@@ -16,10 +16,14 @@
 """
 from typing import Optional
 
+import time
+
 from langgraph.graph import END, START, StateGraph
 
 from app.agent import to_frame
+from app.config import MAX_QUESTION_CHARS
 from app.context import AgentContext
+from app.logging_utils import TokenCounter, log_run
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_code, generate_sql
@@ -150,12 +154,60 @@ class GraphAgent:
     def mode_label(self) -> str:
         return self.ctx.mode_label
 
-    def run(self, question: str, history: Optional[list] = None) -> dict:
-        """执行一次问答，返回最终 state。"""
+    def run(self, question: str, history: Optional[list] = None,
+            config: Optional[dict] = None) -> dict:
+        """执行一次问答，返回最终 state。
+
+        config 会原样透传给 LangGraph，可用于挂回调（评测时统计 token 用量）。
+        超长提问会被截断以保护上下文，截断情况记进日志。
+        """
+        started = time.perf_counter()
+        raw_question = (question or "").strip()
+        truncated = len(raw_question) > MAX_QUESTION_CHARS
+        if truncated:
+            raw_question = raw_question[:MAX_QUESTION_CHARS]
+
         initial: AgentState = {
-            "question": question,
+            "question": raw_question,
             "history": history or [],
             "retry_count": 0,
             "max_retries": self.max_retries,
         }
-        return self.graph.invoke(initial)
+
+        # 自动挂一个 token 计数器：成本监控写进日志，调用方也可再传自己的回调
+        counter = TokenCounter()
+        merged_config = dict(config or {})
+        callbacks = merged_config.get("callbacks") or []
+        if not isinstance(callbacks, (list, tuple)):
+            callbacks = [callbacks]
+        merged_config["callbacks"] = [*callbacks, counter]
+
+        try:
+            state = self.graph.invoke(initial, config=merged_config)
+        except Exception as e:
+            log_run(ok=False, route="", retries=0, rows=0, chart="",
+                    elapsed=round(time.perf_counter() - started, 2),
+                    question=raw_question[:200], question_len=len(raw_question),
+                    truncated=truncated, error=f"{type(e).__name__}: {e}",
+                    llm_calls=counter.calls, tokens_in=counter.input_tokens,
+                    tokens_out=counter.output_tokens)
+            raise
+
+        result = state.get("result")
+        log_run(
+            ok=result is not None,
+            route=state.get("route", ""),
+            retries=int(state.get("retry_count") or 0),
+            rows=0 if result is None else int(len(result)),
+            chart=state.get("chart_type", ""),
+            elapsed=round(time.perf_counter() - started, 2),
+            question=raw_question[:200],
+            question_len=len(raw_question),
+            truncated=truncated,
+            error=(state.get("error") or "")[:300],
+            errors=len(state.get("errors") or []),
+            llm_calls=counter.calls,
+            tokens_in=counter.input_tokens,
+            tokens_out=counter.output_tokens,
+        )
+        return state

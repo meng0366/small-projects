@@ -23,7 +23,7 @@ if _ROOT not in sys.path:
 
 import streamlit as st  # noqa: E402
 
-from app.config import LLM_MODEL, check_config  # noqa: E402
+from app.config import LLM_MODEL, MAX_QUESTIONS_PER_SESSION, check_config  # noqa: E402
 from app.context import AgentContext  # noqa: E402
 from app.graph import GraphAgent  # noqa: E402
 from app.schema.loader import list_tables  # noqa: E402
@@ -62,6 +62,7 @@ def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("pending", None)
+    st.session_state.setdefault("asked", 0)
 
 
 # ---------------------------------------------------------------- 侧边栏
@@ -103,6 +104,9 @@ def render_sidebar(ctx: AgentContext) -> tuple:
             st.session_state.history = []
             st.rerun()
 
+        if MAX_QUESTIONS_PER_SESSION:
+            used = st.session_state.get("asked", 0)
+            st.caption(f"本次会话已提问 {used} / {MAX_QUESTIONS_PER_SESSION} 次")
         st.caption(f"模型：{LLM_MODEL}　|　后端：LangGraph 状态机")
 
     return show_chart, with_insight, show_code
@@ -112,6 +116,7 @@ def render_sidebar(ctx: AgentContext) -> tuple:
 def answer_question(agent: GraphAgent, question: str) -> None:
     """执行一次问答，把结果存入会话状态。"""
     st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.asked = st.session_state.get("asked", 0) + 1
 
     with st.spinner("正在分析…"):
         try:
@@ -212,7 +217,12 @@ def main() -> None:
     st.session_state.pending = None
     typed = st.chat_input("输入你的问题，例如：各区域的销售额是多少？")
     if pending or typed:
-        answer_question(agent, pending or typed)
+        if (MAX_QUESTIONS_PER_SESSION
+                and st.session_state.get("asked", 0) >= MAX_QUESTIONS_PER_SESSION):
+            st.warning(f"本次会话已达到提问上限（{MAX_QUESTIONS_PER_SESSION} 次）。"
+                       "刷新页面可重置，或调整环境变量 `AGENT_MAX_QUESTIONS`。")
+        else:
+            answer_question(agent, pending or typed)
 
     for msg in st.session_state.messages:
         avatar = "🧑" if msg["role"] == "user" else "📊"
