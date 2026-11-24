@@ -1,0 +1,22 @@
+# 构建镜像时排除的东西：密钥、虚拟环境、文档、日志与临时报告
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+docs/
+output/
+evals/reports/
+*.log
+
+.git/
+.gitignore
+.gitattributes
+.vscode/
+.idea/
+.DS_Store

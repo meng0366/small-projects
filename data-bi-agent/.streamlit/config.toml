@@ -1,0 +1,13 @@
+[server]
+# 容器/服务器上不需要自动开浏览器
+headless = true
+# 单次上传上限（MB）；本项目默认不用上传，留一点余量便于扩展
+maxUploadSize = 20
+
+[browser]
+# 关闭 Streamlit 官方使用统计上报
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"
