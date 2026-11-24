@@ -98,6 +98,91 @@ class TestScopeGuard(unittest.TestCase):
         self.assertEqual(strip_code_fence("SELECT 1"), "SELECT 1")
 
 
+class TestQuarterAnchors(unittest.TestCase):
+    """季度也要守（F3.5 / 期次跨度）。
+
+    季度是有歧义的时段写法：用户写「Q2」，模型可能写成 `2025Q2`，也可能展开成
+    `'2025-04'/'2025-05'/'2025-06'` 或日期区间 `>= '2025-04-01' AND < '2025-07-01'`。
+    所以不能只按字面守 —— 三种写法都得放行，只拦"换成别的时间段"。
+    """
+
+    QUESTION = "为什么 2025 年 Q2 的销售额比 Q1 高？"
+    # 逐月展开：Q1+Q2 都在
+    SQL_MONTHS = ("SELECT strftime('%Y-%m', order_date) AS ym, SUM(amount) AS amt FROM orders "
+                  "WHERE strftime('%Y-%m', order_date) IN "
+                  "('2025-01','2025-02','2025-03','2025-04','2025-05','2025-06') GROUP BY ym")
+    # 日期区间：上界写成下季度首月 1 日，末月不会以 '-06' 出现
+    SQL_RANGE = ("SELECT 1 FROM orders WHERE (order_date >= '2025-01-01' AND order_date < '2025-04-01') "
+                 "OR (order_date >= '2025-04-01' AND order_date < '2025-07-01')")
+    # 算出季度列再筛，字面是 '2025-Q2'
+    SQL_LITERAL = ("SELECT 1 FROM orders WHERE strftime('%Y', order_date) || '-Q' || "
+                   "CAST((CAST(strftime('%m', order_date) AS INTEGER) + 2) / 3 AS TEXT) "
+                   "IN ('2025-Q1','2025-Q2')")
+
+    def test_quarter_extracted_in_order(self):
+        anchors = extract_anchors(self.QUESTION, _enums())
+        # 年份只跟紧挨着它写的那个季度绑定，后面光秃秃的「Q1」记为不明年份；
+        # 年份本身另有 year 锚点兜底（重试语句里必须有 2025）。
+        self.assertEqual(anchors["quarters"], [(2025, 2), (None, 1)])
+        self.assertEqual(anchors["months"], [], "季度不该再被拆出一堆月份锚点")
+        self.assertEqual(anchors["years"], ["2025"])
+
+    def test_chinese_quarter_written_without_year(self):
+        anchors = extract_anchors("为什么第二季度的销售额比第一季度高？", _enums())
+        self.assertEqual(anchors["quarters"], [(None, 2), (None, 1)])
+
+    def test_expanded_months_is_fine(self):
+        self.assertEqual(check_scope(self.QUESTION, self.SQL_MONTHS, _enums()), [])
+
+    def test_date_range_is_fine(self):
+        self.assertEqual(check_scope(self.QUESTION, self.SQL_RANGE, _enums()), [])
+
+    def test_quarter_literal_is_fine(self):
+        self.assertEqual(check_scope(self.QUESTION, self.SQL_LITERAL, _enums()), [])
+
+    def test_quarter_narrowed_to_a_month_is_caught(self):
+        """Q2 被缩成 6 月：拿到的数不是那一季度。"""
+        sql = ("SELECT strftime('%Y-%m', order_date) AS ym, SUM(amount) AS amt FROM orders "
+               "WHERE strftime('%Y-%m', order_date) IN "
+               "('2025-01','2025-02','2025-03','2025-06') GROUP BY ym")
+        problems = check_scope(self.QUESTION, sql, _enums())
+        self.assertTrue(any("Q2" in p for p in problems), problems)
+
+    def test_quarter_replaced_by_next_quarter_is_caught(self):
+        sql = self.SQL_MONTHS.replace("'2025-04','2025-05','2025-06'",
+                                      "'2025-07','2025-08','2025-09'")
+        problems = check_scope(self.QUESTION, sql, _enums())
+        self.assertTrue(any("2025年Q2" in p for p in problems), problems)
+
+    def test_quarter_without_year_is_not_blocked(self):
+        """不带年份的季度不该因为语句里写不写 2025 被误拦。"""
+        sql = ("SELECT 1 FROM orders WHERE strftime('%Y-%m', order_date) IN "
+               "('2025-04','2025-05','2025-06')")
+        self.assertEqual(check_scope("Q2 的销售额是多少？", sql, _enums()), [])
+
+    def test_bare_month_numbers_are_fine(self):
+        """有的查询不写日期字符串，直接比月份数字，也得认。"""
+        sql = ("SELECT SUM(amount) AS amt FROM orders WHERE strftime('%Y', order_date) = '2025' "
+               "AND CAST(strftime('%m', order_date) AS INTEGER) BETWEEN 4 AND 6")
+        self.assertEqual(check_scope("2025 年 Q2 的销售额是多少？", sql, _enums()), [])
+
+    def test_limit_number_is_not_a_month(self):
+        """`LIMIT 6` 里的 6 不算六月，否则缩了范围的查询会被放过去。"""
+        sql = "SELECT 1 FROM orders WHERE strftime('%Y', order_date) = '2025' LIMIT 6"
+        problems = check_scope("2025 年 6 月的销售额是多少？", sql, _enums())
+        self.assertTrue(any("6 月" in p for p in problems), problems)
+
+    def test_quarter_regex_matches_attribution(self):
+        """两处季度正则必须认同一批写法，否则守的时段和算的时段会错位。"""
+        from app.tools.attribution import QUARTER_RE as ATTR_RE
+        from app.tools.scope_guard import _QUARTER_RE
+        samples = ["2025Q2", "2025-Q2", "Q2 比 Q1 高", "第二季度", "第 2 季度",
+                   "2025年Q3", "从 Q1 到 Q3", "H1 上半年"]
+        for text in samples:
+            self.assertEqual([m.group(0) for m in _QUARTER_RE.finditer(text)],
+                             [m.group(0) for m in ATTR_RE.finditer(text)], text)
+
+
 class TestScopeGuardInGraph(unittest.TestCase):
     """在状态机里验证：改条件的重试结果必须被丢掉。"""
 
