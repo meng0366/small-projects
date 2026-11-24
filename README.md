@@ -11,7 +11,7 @@
 | 0 | 环境与配置 | ✅ |
 | 1 | 单表问答（Text-to-Pandas，命令行） | ✅ |
 | 2 | 多表 SQL + 图表 + 洞察 | ✅ |
-| 3 | LangGraph 编排 + 错误自愈 | ⬜ 计划中 |
+| 3 | LangGraph 编排 + 错误自愈 + 多轮记忆 | ✅ |
 | 4 | Streamlit 界面 | ⬜ 计划中 |
 | 5 | 评测 / 安全加固 / 部署 | ⬜ 计划中 |
 
@@ -106,13 +106,27 @@ python -m app.cli "各区域的销售额是多少？"
 
 | 参数 | 作用 |
 | --- | --- |
-| `--pandas` | 强制走单表 pandas 模式（默认优先 Text-to-SQL） |
+| `--linear` | 使用线性编排（无重试、无多轮记忆），默认走 LangGraph 状态机 |
+| `--pandas` | 仅线性模式可用：强制走单表 pandas 模式 |
 | `--no-chart` | 不生成图表 |
 | `--no-insight` | 不生成洞察文案（省一次模型调用） |
 | `--quiet` | 不打印生成的 SQL / 代码 |
 
 > 请在**项目根目录**下执行以上命令。
 > 图表输出到 `output/`，为独立 HTML，双击即可在浏览器查看。
+
+### 8. 多轮追问
+
+交互模式下会记住上下文，可以直接用省略说法：
+
+```
+> 各区域的销售额是多少？
+（返回五个区域的销售额）
+
+> 只看华东
+[改写] 华东区域的销售额是多少？
+（自动加上 WHERE c.region = '华东'）
+```
 
 ## 示例问题
 
@@ -131,21 +145,22 @@ python -m app.cli "各区域的销售额是多少？"
 app/
 ├── config.py            # 配置与密钥读取
 ├── llm.py               # LLM 客户端与代码块清洗
-├── state.py             # Agent 状态结构
-├── agent.py             # 编排入口（SQL 优先，失败回退 pandas）
+├── context.py           # 运行时上下文（数据/Schema/术语，惰性加载）
+├── state.py             # AgentState 状态结构
+├── graph.py             # LangGraph 状态机（含重试环）
+├── agent.py             # 线性编排（--linear 时使用）
 ├── cli.py               # 命令行入口
-├── graph.py             # LangGraph 状态机（阶段 3）
 ├── main.py              # Streamlit 界面（阶段 4）
 ├── schema/
 │   ├── loader.py        # 数据加载 / Schema 描述（DataFrame 版 + 数据库版）
 │   └── catalog.yaml     # 业务语义词典（字段含义、指标口径、枚举值）
-├── prompts/templates.py # Prompt 模板（代码生成 / SQL 生成 / 洞察）
+├── prompts/templates.py # Prompt 模板（代码/SQL/洞察/问题改写/错误修正）
 ├── nodes/
-│   ├── generate.py      # Text-to-Pandas 代码生成 + Text-to-SQL 生成
+│   ├── understand.py    # 问题理解：多轮改写 + 路由判定
+│   ├── generate.py      # Text-to-Pandas / Text-to-SQL 生成
 │   ├── execute.py       # Python 代码安全执行
-│   ├── answer.py        # 结果压缩 + 洞察文案生成
-│   ├── understand.py    # 问题理解（阶段 3）
-│   └── reflect.py       # 错误反思（阶段 3）
+│   ├── reflect.py       # 反思重试与换路
+│   └── answer.py        # 结果压缩 + 洞察生成
 └── tools/
     ├── sql_tool.py      # SQL 安全校验与只读执行
     ├── chart_tool.py    # 规则式自动选图（Plotly）
@@ -155,19 +170,23 @@ data/
 ├── sales_orders.csv     # 模拟销售宽表
 └── generate_mock_data.py # 模拟数据生成脚本
 tests/
-└── test_smoke.py          # 离线冒烟测试
+├── test_smoke.py        # 离线冒烟测试（34 个用例）
+└── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
 ```
 
 ## 工作流程
 
 ```
-问题
- ├─ 有数据库 → 生成 SQL → 安全检查（仅单条 SELECT / 只读连接）→ 执行
- │              └─ 失败 → 自动回退下面的 pandas 路径
- └─ 回退 / 单表模式 → 生成 pandas 代码
-                      → 安全检查（黑名单 + 语法编译 + 受限命名空间）→ 执行
+问题 + 历史对话
  ↓
-结果 DataFrame → 规则式选图（Plotly HTML）+ 统计分析 → LLM 生成中文洞察
+understand：有历史则改写成完整问题；判定走 SQL 还是 pandas
+ ↓
+generate：生成 SQL 或 pandas 代码（重试时带上一次的真实报错）
+ ↓
+execute：SQL 走只读库 / 代码走受限命名空间
+ ↓
+  ├─ 成功 ─→ answer：规则选图（Plotly HTML）+ 统计分析 → 中文洞察
+  └─ 失败 ─→ reflect：记录错误、SQL 失败则换 pandas → 回到 generate（最多 2 次）
 ```
 
 ## 安全说明（重要）
@@ -180,11 +199,18 @@ tests/
 
 ## 测试
 
-离线冒烟测试（不调用 LLM，无需 API Key）：
+离线测试（**不调用 LLM，无需 API Key**）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+共 39 个用例，覆盖：
+
+| 测试文件 | 内容 |
+| --- | --- |
+| `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
+| `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级（全部 mock LLM） |
 
 ## 设计参考
 
