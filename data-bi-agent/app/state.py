@@ -39,6 +39,8 @@ class AgentState(TypedDict, total=False):
     max_retries: int                 # 最大重试次数
     empty_result: bool               # 本次结果是否为空（0 行）——执行成功但没查到数据
     empty_retried: bool              # 是否已因空结果重试过（只给一次机会，避免空转）
+    defer: str                       # 答不了的原因（模型声明缺字段 / 重试改动了用户条件，P0-2b）
+    scope_violation: List[str]       # 重试时被改动的用户条件明细（展示给用户，P0-2b）
 
     # ---- 输出 ----
     insight: str                     # 洞察文案

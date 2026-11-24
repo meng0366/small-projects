@@ -135,6 +135,7 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "answer": state.get("answer") or "",
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
+        "deferred": bool(state.get("defer")),
         "suggestions": state.get("suggestions") or [],
     })
 
@@ -152,7 +153,12 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
     question = msg.get("question", "")
 
     if df is None:
-        st.warning(msg.get("answer") or "未能完成分析。")
+        # 拒答是"正常结论"（这题确实答不了），按正文展示；真正的失败才用警示样式
+        if msg.get("deferred"):
+            st.markdown(msg.get("answer") or "这个问题用现有数据答不了。")
+            st.caption("没有给数字，是因为给出数字就意味着换了个口径或换了个范围")
+        else:
+            st.warning(msg.get("answer") or "未能完成分析。")
         for err in msg.get("errors") or []:
             st.caption(f"· {err}")
         return

@@ -118,16 +118,21 @@ def make_reflect_node(ctx: AgentContext, fallback_route: str = FALLBACK_ROUTE):
 def route_after_execute(state: AgentState) -> str:
     """条件边：执行后决定去回答还是去反思重试。
 
-    四种情况：
+    五种情况：
     - 聚合型空（1 行 NULL，如 SUM 无匹配）→ 直接回答，**不重试**：
       放宽条件会把别的时段/地区的数算进同一个指标，产出"看起来正常"的错数；
     - 明细型空（0 行）且还没因空结果重试过 → 反思一次（放宽条件）；
     - 明细型空但已重试过 / 重试次数用尽 → 回答（如实说明没数据）；
+    - 已判定答不了（defer：缺字段，或重试改动了用户条件）→ 直接回答，不再重试；
     - 真出错（result 为 None）→ 还有次数就反思（换路），否则回答失败说明。
     """
     result = state.get("result")
     retry_count = state.get("retry_count", 0)
     max_retries = state.get("max_retries", DEFAULT_MAX_RETRIES)
+
+    # 已经确定"这题答不了"：再让模型换路只会得到另一个问题或一个错数
+    if state.get("defer"):
+        return "answer"
 
     if result is not None:
         if is_aggregate_empty(result):

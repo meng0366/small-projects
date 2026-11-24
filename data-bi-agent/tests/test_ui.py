@@ -92,6 +92,27 @@ class TestWebUI(unittest.TestCase):
         self.assertEqual(len(at.warning), 1)
         self.assertIn("未能完成分析", at.warning[0].value)
 
+    def test_deferred_answer_is_not_a_warning(self):
+        """拒答是"正常结论"：用正文展示，不要套失败样式吓人。"""
+        at = self._app()
+        deferred = {
+            "question": "每个商品的毛利率是多少？",
+            "route": "sql",
+            "result": None,
+            "defer": "缺少成本/进价字段",
+            "answer": "这个问题用现有数据答不了，也不该编一个数字给你。\n\n原因：缺少成本/进价字段",
+            "errors": [],
+            "retry_count": 0,
+        }
+        with mock.patch("app.graph.GraphAgent.run", return_value=deferred):
+            at.chat_input[0].set_value("每个商品的毛利率是多少？").run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual(len(at.dataframe), 0)
+        self.assertEqual(len(at.warning), 0, "拒答不该走失败告警样式")
+        self.assertTrue(any("答不了" in m.value for m in at.markdown))
+        self.assertTrue(any("没有给数字" in c.value for c in at.caption))
+
     def test_multi_turn_shows_rewrite(self):
         at = self._app()
         follow_up = dict(FAKE_STATE, question="只看华东",

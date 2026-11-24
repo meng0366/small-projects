@@ -39,6 +39,7 @@ from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
 from app.tools.enum_guard import build_clarify_answer
+from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -73,7 +74,14 @@ def make_generate_node(ctx: AgentContext):
 
 
 def make_execute_node(ctx: AgentContext):
-    """执行节点：SQL 走只读库，pandas 走受限命名空间。"""
+    """执行节点：SQL 走只读库，pandas 走受限命名空间。
+
+    执行前有两道守卫（P0-2b，都由真实评测暴露出来）：
+    1. **模型说答不了**（`DEFER: 原因` 或整段自然语言）时不要当 SQL 执行 ——
+       以前这种句子会报语法错，重试后就跑到另一个问题上去，最后把别的问题的答案交出去；
+    2. **空结果重试不得改动用户的条件** —— 实测会把「2024 年 3 月」改成「2025-03」
+       拿回 100 行真实数据冒充，用户完全看不出来。
+    """
 
     def node(state: AgentState) -> dict:
         statement = state.get("statement")
@@ -87,19 +95,43 @@ def make_execute_node(ctx: AgentContext):
             return {"result": None, "error": state.get("error") or "未生成可执行语句",
                     **history}
 
+        # 守卫 1：模型明确说"库里没有这个字段/数据"
+        reason = parse_defer(statement)
+        if reason is None and state.get("route") == "sql" and not looks_like_sql(statement):
+            # 整段自然语言（如"数据库中不存在退货相关字段"）也当作拒答，别拿去执行
+            reason = statement.strip()[:200] or "模型判断现有数据无法回答这个问题"
+        if reason:
+            return {"result": None, "defer": reason, "error": None, **history}
+
+        # 守卫 2 的前半段：先记下这轮是不是"空结果之后的重试"
+        retrying_after_empty = bool(state.get("empty_result"))
+        question = state.get("rewritten_question") or state.get("question", "")
+
         if state.get("route") == "sql" and ctx.has_db:
             r = run_sql(statement, ctx.db_path)
             if r["ok"]:
-                empty = is_empty_result(r["df"])
-                return {"result": r["df"], "error": None, "empty_result": empty, **history}
+                frame = r["df"]
+                problems = check_scope(question, statement, ctx.enums) \
+                    if retrying_after_empty and not is_empty_result(frame) else []
+                if problems:
+                    # 拿到了数据，但是靠改动用户的条件换来的（如 2024→2025）→ 丢掉，不许用
+                    return {"result": None, "defer": "；".join(problems),
+                            "scope_violation": problems, **history}
+                return {"result": frame, "error": None,
+                        "empty_result": is_empty_result(frame), **history}
             return {"result": None, "error": f"SQL {r['stage']} 阶段：{r['error']}",
                     "empty_result": False, **history}
 
         r = execute_code(statement, ctx.df)
         if r["ok"]:
             frame = to_frame(r["result"])
-            empty = is_empty_result(frame)
-            return {"result": frame, "error": None, "empty_result": empty, **history}
+            problems = check_scope(question, statement, ctx.enums) \
+                if retrying_after_empty and not is_empty_result(frame) else []
+            if problems:
+                return {"result": None, "defer": "；".join(problems),
+                        "scope_violation": problems, **history}
+            return {"result": frame, "error": None,
+                    "empty_result": is_empty_result(frame), **history}
         return {"result": None, "error": f"代码 {r['stage']} 阶段：{r['error']}",
                 "empty_result": False, **history}
 
@@ -137,12 +169,56 @@ def build_empty_answer(ctx: AgentContext, state: AgentState, aggregate: bool) ->
     return "\n".join(parts)
 
 
+def build_defer_answer(ctx: AgentContext, state: AgentState) -> str:
+    """拒答说明：说清"为什么答不了"，而不是给一个换了口径的数字。
+
+    两种情况共用这一段：
+    - 模型声明缺字段（毛利率要成本、退货率要退货表）；
+    - 空结果重试时把用户的条件改了（2024 年改成 2025 年）—— 这种最危险，
+      数字看起来完全正常，用户不会怀疑，所以必须在这里挑明并拒绝。
+    """
+    reason = (state.get("defer") or "").strip()
+    problems = state.get("scope_violation") or []
+    parts = []
+
+    if problems:
+        parts.append("没法按你给的条件出数，也没有拿别的范围顶替。")
+        parts.append("")
+        parts.append("自动复核时发现，重试的查询把你限定的条件改动过：")
+        parts.extend(f"- {item}" for item in problems)
+        parts.append("")
+        parts.append("你的条件本身没问题，是这个范围在库里没有数据 —— "
+                     "改条件之后算出来的数字不能当成这个问题的答案，所以没有给。")
+    else:
+        parts.append("这个问题用现有数据答不了，也不该编一个数字给你。")
+        if reason:
+            parts.append("")
+            parts.append(f"原因：{reason}")
+
+    profile = ctx.data_profile_text
+    if profile:
+        parts.append("")
+        parts.append("库里实际覆盖的范围：")
+        parts.append(profile)
+
+    parts.append("")
+    parts.append("如果要的是库里有的口径，把条件改成上面列出的范围或取值，我再算。")
+    return "\n".join(parts)
+
+
 def make_answer_node(ctx: AgentContext, with_chart: bool = True,
                      with_insight: bool = True):
     """回答节点：出图 + 生成洞察；彻底失败时给出可读的说明。"""
 
     def node(state: AgentState) -> dict:
         result = state.get("result")
+
+        # 拒答：模型声明缺字段，或重试时改动了用户的条件（P0-2b）。
+        # 这时一个数字都不能给 —— 给了就是把别的问题的答案冒名顶替。
+        if state.get("defer"):
+            answer = build_defer_answer(ctx, state)
+            return {"insight": answer, "answer": answer,
+                    "chart_type": "none", "chart_path": ""}
 
         if result is None:
             errors = state.get("errors") or []
@@ -301,8 +377,9 @@ class GraphAgent:
             state["suggestions"] = []
 
         log_run(
-            ok=result is not None or bool(unknown),
+            ok=result is not None or bool(unknown) or bool(state.get("defer")),
             clarify=bool(unknown),
+            defer=bool(state.get("defer")),
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),

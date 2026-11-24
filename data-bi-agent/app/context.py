@@ -66,6 +66,11 @@ class AgentContext:
         return format_data_profile(self.data_profile)
 
     @cached_property
+    def enums(self) -> list:
+        """枚举列的真实取值（取自数据画像），供取值校验与范围守卫共用。"""
+        return list(self.data_profile.get("enums") or [])
+
+    @cached_property
     def catalog(self) -> dict:
         return load_catalog()
 
