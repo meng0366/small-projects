@@ -1,4 +1,5 @@
 # 数据分析 Agent（Text-to-Pandas / Text-to-SQL）
+![离线测试](https://github.com/meng0366/small-projects/actions/workflows/tests.yml/badge.svg?branch=main)
 
 用自然语言向数据提问，Agent 自动生成并执行分析代码，返回结果表格与洞察。
 
@@ -15,7 +16,7 @@
 | 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ✅ |
 | 6 | 命令行增强（子命令 / 子命令输出格式 / 会话续聊 / 追问建议） | ✅ |
-| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 修正回流（teach、lessons）/ **指标归因（为什么变了）** | ✅ |
+| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ **持续集成（GitHub Actions）** | ✅ |
 
 ## 环境要求
 
@@ -345,12 +346,13 @@ tests/
 ├── test_scope.py        # 范围守卫测试（13 个用例，含"改年份换出数据"的拒绝）
 ├── test_lesson.py       # 修正回流测试（27 个用例：入库校验、指纹隔离、相关度正反例、注入位置）
 ├── test_attribution.py  # 指标归因测试（25 个用例：语序定基期、跨年歧义、合计行、比率指标、降级）
-├── test_ui.py           # 网页界面测试（6 个用例，全 mock LLM）
+├── test_ui.py           # 网页界面测试（7 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（34 个用例，含 refuse/clarify）
 ├── test_security.py     # 安全防护测试（16 个用例）
-├── test_deploy.py       # 部署配置测试（9 个用例）
-└── test_cli.py          # 命令行与新模块测试（50 个用例，全离线）
+├── test_deploy.py       # 部署配置测试（12 个用例，含配置总闸）
+└── test_cli.py          # 命令行与新模块测试（51 个用例，全离线）
 Dockerfile               # 单镜像部署（含中文字体与健康检查）
+.github/workflows/tests.yml  # CI：每次推送跑离线测试并构建镜像（在仓库根，与项目同级）
 .streamlit/config.toml   # 界面主题与服务器配置
 ```
 
@@ -460,7 +462,7 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 235 个用例，覆盖：
+共 238 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -473,8 +475,23 @@ python -m unittest discover -s tests -v
 | `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、拒答走正文而非告警、多轮改写与历史传递、追问建议按钮（全部 mock LLM） |
 | `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容）、refuse/clarify 正反例（给了数就判错） |
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
-| `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、容器文件与忽略规则、Streamlit 配置解析 |
+| `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
 | `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、追问建议、退出码 |
+
+### 持续集成
+
+推送到 GitHub 后自动跑同一套测试（`.github/workflows/tests.yml`，**放在仓库根**）：
+
+| 作业 | 做什么 |
+| --- | --- |
+| `offline-tests` | Python 3.12 与 3.13 双版本；按 `pip install -r requirements.txt` 安装（就是你要用的那条命令）；跑全部离线用例 + `evals.run_eval --dry-run` |
+| `docker-image` | 构建镜像 → 断言镜像里没有 `.env` → 在容器里再跑一遍同一套测试 |
+
+**CI 里刻意不注入任何密钥**，并额外做一次静态扫描（不许有 `.env`、不许有 `DEEPSEEK_API_KEY`、
+扫一遍 `sk-` 长串）。这样既不会有云端账单，也反过来证明这些用例真的不联网。
+
+> 想在自己机器上模拟 CI（没有任何本机配置）：
+> `git archive HEAD data-bi-agent | tar -x -C /tmp/ci-sim` 然后进去跑测试即可。
 
 ## 评测
 

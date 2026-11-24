@@ -1,0 +1,112 @@
+name: 离线测试
+
+# 这个仓库是多个小项目共用的，本工作流只负责 data-bi-agent/。
+#
+# 设计原则：
+# 1. 全部用例不调用大模型 —— CI 里刻意不注入任何密钥，既省成本，
+#    也能证明代码没有偷偷联网；
+# 2. 按 README 写的方式安装依赖（requirements.txt），验证"别人 clone 下来能跑"；
+# 3. 额外构建一次 Docker 镜像并在镜像里跑同一套测试，覆盖"镜像只是写了没实测"的缺口。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "data-bi-agent/**"
+      - ".github/workflows/tests.yml"
+  pull_request:
+    paths:
+      - "data-bi-agent/**"
+      - ".github/workflows/tests.yml"
+  workflow_dispatch: # 支持在 Actions 页面手动点一下重跑
+
+# 同一分支连续推送时，取消上一次还在跑的，避免排队堆积
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    name: 离线测试（Python ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: data-bi-agent
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 与 Dockerfile 的 python:3.12-slim 对齐；3.13 是本地开发用的版本
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            data-bi-agent/requirements.txt
+            data-bi-agent/requirements.lock.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 确认环境里没有密钥
+        # 仓库是公开的，一旦有人误把 .env 提交上来，这一步会直接拦下。
+        # 注意：下面几条检查用的都是固定字符串，不读任何 secret。
+        run: |
+          if [ -e .env ]; then
+            echo "::error::仓库里不应该有 .env（密钥文件），请检查 .gitignore"
+            exit 1
+          fi
+          if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "::error::CI 不应该注入 DEEPSEEK_API_KEY，离线测试无需联网"
+            exit 1
+          fi
+          if git grep -n -I -E "sk-[A-Za-z0-9]{20,}" -- . ':!*.lock.txt'; then
+            echo "::error::疑似真实密钥被提交进仓库"
+            exit 1
+          fi
+          echo "检查通过：无 .env、无密钥、无注入"
+
+      - name: 离线测试（不调用 LLM）
+        env:
+          DEEPSEEK_API_KEY: ""
+        run: python -m unittest discover -s tests -v
+
+      - name: 评测集干跑（只校验用例与金标准，不花 token）
+        env:
+          DEEPSEEK_API_KEY: ""
+        run: python -m evals.run_eval --dry-run
+
+  docker-image:
+    name: 构建镜像并在容器里跑测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: offline-tests # 用例都不过就不用折腾镜像了
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建镜像
+        working-directory: data-bi-agent
+        run: docker build -t data-bi-agent:ci .
+
+      - name: 镜像里不该有 .env
+        run: |
+          if docker run --rm --entrypoint sh data-bi-agent:ci -c 'test -e .env'; then
+            echo "::error::镜像里含有 .env，密钥会被打进镜像层"
+            exit 1
+          fi
+          echo "镜像内无 .env"
+
+      - name: 在容器里跑同一套离线测试
+        # 容器里没有 .env、没有密钥，能跑通说明测试本身不依赖本机环境
+        run: |
+          docker run --rm -e DEEPSEEK_API_KEY="" data-bi-agent:ci \
+            python -m unittest discover -s tests
