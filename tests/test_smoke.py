@@ -14,6 +14,7 @@ from app.schema.loader import (
     list_tables,
     build_db_schema_text,
 )
+from app.tools.sql_tool import run_sql
 
 
 class TestSafety(unittest.TestCase):
@@ -99,6 +100,51 @@ class TestDbSchema(unittest.TestCase):
     def test_db_schema_mentions_row_count(self):
         text = build_db_schema_text(self.db_path)
         self.assertIn("3877 行", text)
+
+
+class TestSqlTool(unittest.TestCase):
+    """SQL 安全校验与只读执行（F2.3 / F2.4）。"""
+
+    def setUp(self):
+        self.db_path = get_db_path()
+
+    def test_select_runs(self):
+        r = run_sql("SELECT region, COUNT(*) AS n FROM customers GROUP BY region",
+                    self.db_path)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["rows"], 5)
+
+    def test_blocks_delete(self):
+        r = run_sql("DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "safety")
+
+    def test_blocks_multiple_statements(self):
+        r = run_sql("SELECT 1; DROP TABLE orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_blocks_comment_bypass(self):
+        r = run_sql("SELECT 1 /* x */; DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_blocks_pragma(self):
+        r = run_sql("PRAGMA table_info(orders)", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_with_delete_blocked(self):
+        r = run_sql("WITH t AS (SELECT 1) DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_truncation(self):
+        r = run_sql("SELECT * FROM orders", self.db_path, max_rows=10)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["rows"], 10)
+        self.assertTrue(r["truncated"])
+
+    def test_runtime_error_reported(self):
+        r = run_sql("SELECT not_a_column FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "runtime")
 
 
 if __name__ == "__main__":
