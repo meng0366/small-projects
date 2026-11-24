@@ -1,11 +1,73 @@
-"""问题理解节点（对应功能 F3.2，阶段 3 实现）。
+"""问题理解节点（对应功能 F3.1 / S3.2，阶段 3 实现）。
 
-职责：解析用户问题，结合 schema 与对话历史，生成结构化的分析意图。
+职责：
+1. 多轮记忆：有历史时，把追问改写成不依赖上下文的完整问题（"只看华东" → "华东各品类销售额"）；
+2. 路由判定：有数据库走 Text-to-SQL，否则走 Text-to-Pandas；
+3. 注入对应的 schema 与业务术语。
+
+省成本设计：**没有历史时不调用 LLM**，直接用原问题——单轮场景不该为改写付 token。
 """
+from typing import List
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from app.context import AgentContext
+from app.llm import get_llm
+from app.prompts.templates import REWRITE_SYSTEM, REWRITE_USER_TEMPLATE
 from app.state import AgentState
 
+HISTORY_LIMIT = 6  # 最多带入 6 条历史（约 3 轮）
 
-def understand(state: AgentState) -> AgentState:
-    """理解用户问题（占位，待实现）。"""
-    # TODO: 结合对话历史改写问题，补全指代（如"只看华东"）
-    return state
+
+def format_history(history: List[dict], limit: int = HISTORY_LIMIT) -> str:
+    """把对话历史格式化为可读文本。"""
+    if not history:
+        return "（无）"
+    recent = history[-limit:]
+    lines = []
+    for msg in recent:
+        role = "用户" if msg.get("role") == "user" else "分析结果"
+        content = str(msg.get("content", "")).strip().replace("\n", " ")
+        if len(content) > 200:
+            content = content[:200] + "…"
+        lines.append(f"{role}：{content}")
+    return "\n".join(lines)
+
+
+def rewrite_question(question: str, history: List[dict]) -> str:
+    """结合历史改写问题；无历史或调用失败时返回原问题。"""
+    if not history:
+        return question
+
+    try:
+        resp = get_llm().invoke([
+            SystemMessage(content=REWRITE_SYSTEM),
+            HumanMessage(content=REWRITE_USER_TEMPLATE.format(
+                history=format_history(history), question=question)),
+        ])
+        text = (resp.content or "").strip().strip('"').strip("“”")
+        return text or question
+    except Exception:
+        return question
+
+
+def make_understand_node(ctx: AgentContext):
+    """构造理解节点（闭包持有运行时上下文）。"""
+
+    def node(state: AgentState) -> dict:
+        question = state.get("question", "")
+        history = state.get("history") or []
+
+        rewritten = rewrite_question(question, history)
+        route = "sql" if ctx.has_db else "pandas"
+        schema_info = ctx.db_schema if route == "sql" else ctx.df_schema
+
+        return {
+            "rewritten_question": rewritten,
+            "route": route,
+            "schema_info": schema_info,
+            "terms": ctx.terms,
+            "retry_count": state.get("retry_count", 0),
+        }
+
+    return node
