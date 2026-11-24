@@ -5,6 +5,7 @@
 - 阶段事件落盘字段，且不会被 `read_runs()` 当成"一次问答"混进 logs 表格
 - `read_events()` 精确匹配与前缀回退、顺序即执行顺序
 - 状态机里四个阶段同挂一个 trace_id，汇总行同号
+- 线性编排（`--linear`）同样有链，SQL 失败回退 pandas 时两组 generate/execute 都在
 - 重试环、澄清分支、节点抛异常三种非顺利路径都要留痕
 - `cli logs --trace` 的链路视图与找不到时的退出码
 """
@@ -18,6 +19,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import app.agent as A
 import app.graph as G
 import app.logging_utils as lu
 from app.cli import EXIT_OK, EXIT_USAGE, _show_trace
@@ -25,6 +27,7 @@ from app.cli import EXIT_OK, EXIT_USAGE, _show_trace
 GOOD_SQL = ("SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 "
             "FROM orders o JOIN customers c ON o.customer_id = c.customer_id "
             "GROUP BY c.region ORDER BY 销售额 DESC")
+GOOD_PANDAS = 'result = df.groupby("region")["amount"].sum().reset_index()'
 BAD_SQL = "SELECT nope FROM orders"
 BAD_CODE = 'result = df["nope"].sum()'
 
@@ -203,6 +206,83 @@ class TestGraphTrace(TraceLogCase):
         self.assertIn("RuntimeError", events[-1]["error"])
 
 
+class TestLinearTrace(TraceLogCase):
+    """线性编排（`--linear`）也要有链 —— 否则两种引擎的排查方式不一致。"""
+
+    def _run(self, question="各区域的销售额是多少？", sql=GOOD_SQL,
+             code=None, force_pandas=False):
+        agent = A.DataAgent(with_chart=False, with_insight=False,
+                            force_pandas=force_pandas)
+        with mock.patch.object(A, "generate_sql", mock.Mock(return_value=sql)), \
+                mock.patch.object(A, "generate_code",
+                                  mock.Mock(return_value=code or BAD_CODE)):
+            return agent.run(question, [])
+
+    def stages_of(self, trace_id: str) -> list:
+        return [e["stage"] for e in lu.read_events(trace_id, path=self.log_file)]
+
+    def test_happy_path_chain(self):
+        state = self._run()
+        trace = state["trace_id"]
+        self.assertEqual(self.stages_of(trace), ["generate", "execute", "answer"])
+
+        summaries = lu.read_runs(limit=0, path=self.log_file)
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["trace_id"], trace)
+        self.assertEqual(summaries[0]["engine"], "linear")
+        self.assertEqual(summaries[0]["rows"], 5)
+
+    def test_statement_text_not_logged(self):
+        state = self._run()
+        events = lu.read_events(state["trace_id"], path=self.log_file)
+        self.assertNotIn("SELECT", json.dumps(events, ensure_ascii=False))
+        self.assertGreater(events[0]["statement_len"], 0)
+
+    def test_summary_does_not_fake_token_usage(self):
+        """线性版没挂 token 回调：不写 llm_calls/tokens，别用 0/0 假装统计过。"""
+        self._run()
+        summary = lu.read_runs(limit=0, path=self.log_file)[0]
+        self.assertNotIn("llm_calls", summary)
+        self.assertNotIn("tokens_in", summary)
+
+    def test_sql_failure_falls_back_to_pandas(self):
+        """链里两组 generate/execute 就是"回退过"，第二组带 fallback 标记。"""
+        state = self._run(sql=BAD_SQL, code=GOOD_PANDAS)
+        self.assertEqual(state["route"], "pandas")
+        self.assertEqual(self.stages_of(state["trace_id"]),
+                         ["generate", "execute", "generate", "execute", "answer"])
+
+        events = lu.read_events(state["trace_id"], path=self.log_file)
+        self.assertTrue(events[1].get("failed"))
+        self.assertTrue(events[3].get("fallback"))
+
+    def test_total_failure_ends_with_failed_answer(self):
+        """两条路都没成时链尾要留一行失败，否则链看起来"没走完"。"""
+        state = self._run(sql=BAD_SQL, code=BAD_CODE)
+        self.assertIsNone(state["result"])
+        events = lu.read_events(state["trace_id"], path=self.log_file)
+        self.assertEqual(events[-1]["stage"], "answer")
+        self.assertTrue(events[-1]["failed"])
+
+        summary = lu.read_runs(limit=0, path=self.log_file)[0]
+        self.assertFalse(summary["ok"])
+        self.assertIn("失败", summary["error"])
+
+    def test_force_pandas_skips_sql_attempt(self):
+        state = self._run(force_pandas=True, code=GOOD_PANDAS)
+        self.assertEqual(state["route"], "pandas")
+        self.assertEqual(self.stages_of(state["trace_id"]),
+                         ["generate", "execute", "answer"])
+
+    def test_run_returns_state_for_chat(self):
+        """回归：`chat --linear` 调的是 agent.run()，DataAgent 原先只有 ask()。"""
+        state = self._run()
+        for key in ("route", "result", "trace_id", "suggestions", "answer"):
+            self.assertIn(key, state)
+        self.assertIsInstance(state["suggestions"], list)
+        self.assertTrue(state["trace_id"])
+
+
 class TestShowTrace(TraceLogCase):
     """`cli logs --trace` 的输出。"""
 
@@ -236,6 +316,16 @@ class TestShowTrace(TraceLogCase):
     def test_missing_trace_returns_usage_error(self):
         code, _ = self._call("不存在的号")
         self.assertEqual(code, EXIT_USAGE)
+
+    def test_linear_summary_says_token_not_counted(self):
+        """线性汇总行没有 token 字段：显示"未统计"，不能显示 0/0。"""
+        lu.log_event("20261124-101010-cccccc", "generate", ms=5, route="sql")
+        lu.log_run(ok=True, trace_id="20261124-101010-cccccc", rows=3,
+                   elapsed=0.2, engine="linear")
+        code, out = self._call("20261124-101010-cccccc")
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("token 未统计（线性路线）", out)
+        self.assertIn("（线性编排）", out)
 
 
 if __name__ == "__main__":

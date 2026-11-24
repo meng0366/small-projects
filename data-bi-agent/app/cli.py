@@ -57,7 +57,6 @@ from app.tools.lesson_store import (
     score_lesson,
     select_lessons,
 )
-from app.tools.suggest_tool import suggest_followups
 
 # Windows 控制台默认可能是 GBK，强制 UTF-8 输出，避免中文打印报 UnicodeEncodeError
 if hasattr(sys.stdout, "reconfigure"):
@@ -181,7 +180,11 @@ def build_agent(args):
     with_chart = not getattr(args, "no_chart", False)
     with_insight = not getattr(args, "no_insight", False)
     if getattr(args, "linear", False):
-        return DataAgent(ctx=ctx), "线性编排（无重试、无记忆）"
+        # 线性引擎也收 with_chart / with_insight / force_pandas，
+        # 否则 `chat --linear --no-chart` 这类组合会被静默忽略
+        return DataAgent(ctx=ctx, with_chart=with_chart, with_insight=with_insight,
+                         force_pandas=getattr(args, "pandas", False)), \
+            "线性编排（无重试、无记忆）"
     return GraphAgent(ctx, with_chart=with_chart, with_insight=with_insight), \
         "LangGraph 状态机（含重试与多轮记忆）"
 
@@ -195,38 +198,15 @@ def resolve_question(question: Optional[str]) -> str:
     return question.strip()
 
 
-def _state_from_linear(res, question: str) -> dict:
-    """把线性编排的结果整理成与状态机一致的 dict，后面统一渲染。"""
-    return {
-        "route": res.route,
-        "statement": res.statement,
-        "result": res.df,
-        "insight": res.insight,
-        "chart_path": res.chart_path,
-        "chart_type": res.chart_type,
-        "errors": list(res.errors),
-        "retry_count": 0,
-        "answer": "" if res.ok else "未能完成分析。",
-        "suggestions": suggest_followups(question, res.df),
-    }
-
-
 def ask_once(args, question: str) -> dict:
-    """执行一次问答，返回状态 dict（附 `_elapsed`）。"""
+    """执行一次问答，返回状态 dict（附 `_elapsed`）。
+
+    两种引擎都走 `agent.run()`：线性版补了同签名接口（含追踪号），
+    否则 `chat --linear` 会 AttributeError，`ask --linear` 也拿不到追踪号。
+    """
     started = time.perf_counter()
     agent, _ = build_agent(args)
-
-    if getattr(args, "linear", False):
-        res = agent.ask(
-            question,
-            with_chart=not args.no_chart,
-            with_insight=not args.no_insight,
-            force_pandas=args.pandas,
-        )
-        state = _state_from_linear(res, question)
-    else:
-        state = agent.run(question, [])
-
+    state = agent.run(question, [])
     state["_elapsed"] = round(time.perf_counter() - started, 2)
     return state
 
@@ -598,7 +578,9 @@ def run_logs(args) -> int:
     print(f"{'时间':<20}{'结果':<6}{'路由':<8}{'重试':>4}{'行数':>6}{'耗时':>8}"
           f"{'tokens(入/出)':>16}  {'追踪号':<22}  问题")
     for row in rows:
-        tokens = f"{row.get('tokens_in', 0)}/{row.get('tokens_out', 0)}"
+        # 线性路线的汇总行没有 token 字段，显示"—"而不是 0/0（后者会被当成"真的没花钱"）
+        tokens = (f"{row.get('tokens_in', 0)}/{row.get('tokens_out', 0)}"
+                  if "tokens_in" in row else "—")
         print(f"{str(row.get('ts', '')):<20}"
               f"{'成功' if row.get('ok') else '失败':<6}"
               f"{str(row.get('route') or '-'):<8}"
@@ -623,7 +605,7 @@ def _show_trace(trace_id: str, as_json: bool = False) -> int:
     events = read_events(trace_id)
     if not events:
         print(f"没有找到追踪号 {trace_id} 的阶段记录。", file=sys.stderr)
-        print("只有状态机路线（默认）会产生分阶段事件；`--linear` 不经过节点，没有链。",
+        print("可能是号码抄错（支持前缀与尾号），或这次问答发生在追踪功能上线之前。",
               file=sys.stderr)
         print("看最近几次：python -m app.cli logs", file=sys.stderr)
         return EXIT_USAGE
@@ -656,11 +638,16 @@ def _show_trace(trace_id: str, as_json: bool = False) -> int:
     summary = next((r for r in read_runs(limit=0)
                     if r.get("trace_id") == trace_id), None)
     if summary:
+        # 线性路线没挂 token 回调：宁可说"未统计"，也不打印 0/0 假装统计过
+        if "llm_calls" in summary:
+            usage = (f"{int(summary.get('llm_calls') or 0)} 次模型调用 · "
+                     f"tokens {summary.get('tokens_in', 0)}/{summary.get('tokens_out', 0)}")
+        else:
+            usage = "token 未统计（线性路线）"
+        engine = {"graph": "状态机", "linear": "线性编排"}.get(summary.get("engine") or "")
         print(f"汇总：{'成功' if summary.get('ok') else '失败'} · "
-              f"{int(summary.get('rows') or 0)} 行 · "
-              f"{int(summary.get('llm_calls') or 0)} 次模型调用 · "
-              f"tokens {summary.get('tokens_in', 0)}/{summary.get('tokens_out', 0)} · "
-              f"{summary.get('elapsed')}s")
+              f"{int(summary.get('rows') or 0)} 行 · {usage} · "
+              f"{summary.get('elapsed')}s" + (f"（{engine}）" if engine else ""))
         if summary.get("error"):
             print(f"错误：{summary['error']}")
     return EXIT_OK

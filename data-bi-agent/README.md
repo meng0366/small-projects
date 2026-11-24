@@ -212,6 +212,7 @@ python -m app.cli logs --trace 240001  # 看某一次问答的各阶段耗时（
 ```
 
 显示时间、成败、路由、重试次数、结果行数、耗时、token 用量、追踪号。日志在 `output/logs/agent.jsonl`。
+`--linear` 的汇总行没有 token 统计（线性路线没挂回调），那一列显示 `—`。
 
 ### 一次问答的链路：慢在哪、卡在哪
 
@@ -234,7 +235,20 @@ python -m app.cli logs --trace 20261124-225725-240001
 **汇总行**（没有 `stage`）。generate 慢说明改写或生成卡住，execute 慢说明 SQL 本身重；
 链里出现两次 `generate → execute` 就是走了重试环。`--trace` 只给尾号 `240001` 也能查到。
 
-只有状态机路线（默认）有分阶段事件，`--linear` 不经过节点，查不到时会明确提示。
+只有状态机路线有 `understand` / `clarify` / `reflect` 这些阶段；`--linear` 路线同样有链，
+但固定是 `generate → execute → answer`，SQL 失败回退 pandas 时会出现第二组
+`generate → execute`（带 `fallback`），一眼能看出"回退过"：
+
+```bash
+python -m app.cli ask "各区域的销售额是多少？" --linear --no-chart
+# ... [追踪] 20261124-232853-080001
+# 阶段          耗时  关键信息
+# generate    1125ms  route=sql · statement_len=163
+# execute        5ms  route=sql · rows=5
+# answer       969ms  rows=5 · chart=none
+# 汇总：成功 · 5 行 · token 未统计（线性路线） · 2.1s（线性编排）
+```
+
 日志只记标量字段，**SQL 全文与结果表不会落盘**。
 
 ### teach / lessons：答错一次，以后都对
@@ -273,7 +287,7 @@ python -m app.cli lessons --rm L001            # 删掉一条
 | `--db PATH` | 换一个 SQLite 库文件（默认 `data/sales.db`）；路径不存在直接报错退出 | ask / chat / schema |
 | `--no-chart` | 不生成图表 | ask / chat |
 | `--no-insight` | 不生成洞察文案（省一次模型调用） | ask / chat |
-| `--linear` | 用线性编排（无重试、无多轮记忆），便于对比 | ask / chat |
+| `--linear` | 用线性编排（无重试、无多轮记忆），便于对比；同样有追踪链路 | ask / chat |
 | `--pandas` | 仅线性模式：强制走单表 pandas | ask / chat |
 | `-q, --quiet` | 不打印生成的 SQL / 代码 | ask |
 
@@ -331,7 +345,7 @@ app/
 ├── state.py             # AgentState 状态结构
 ├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
 ├── logging_utils.py     # 运行日志、token 计数与 trace_id 链路追踪（阶段事件 + 汇总行）
-├── agent.py             # 线性编排（--linear 时使用）
+├── agent.py             # 线性编排（--linear 时使用，也写阶段日志）
 ├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / version）
 ├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
 ├── sessions.py          # 会话持久化（~/.data-agent/sessions，支持 chat -c 续聊）
@@ -488,7 +502,7 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 260 个用例，覆盖：
+共 268 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -503,7 +517,7 @@ python -m unittest discover -s tests -v
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
 | `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、`logs --trace` 参数、追问建议、退出码 |
-| `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、重试环与澄清分支的链路、节点异常留痕、CLI 链路输出 |
+| `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、状态机的重试环与澄清分支、线性路线的顺利/回退/全失败三条链、节点异常留痕、CLI 链路输出 |
 
 ### 持续集成
 

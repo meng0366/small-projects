@@ -464,7 +464,7 @@ class GraphAgent:
             state = self.graph.invoke(initial, config=merged_config)
         except Exception as e:
             log_run(ok=False, route="", retries=0, rows=0, chart="",
-                    trace_id=trace_id,
+                    trace_id=trace_id, engine="graph",
                     elapsed=round(time.perf_counter() - started, 2),
                     question=raw_question[:200], question_len=len(raw_question),
                     truncated=truncated, error=f"{type(e).__name__}: {e}",
@@ -502,6 +502,7 @@ class GraphAgent:
         log_run(
             ok=result is not None or bool(unknown) or bool(state.get("defer")),
             trace_id=trace_id,
+            engine="graph",
             clarify=bool(unknown),
             defer=bool(state.get("defer")),
             attribution=bool((state.get("attribution") or {}).get("ok")),

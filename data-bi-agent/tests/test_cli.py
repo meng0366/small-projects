@@ -408,9 +408,8 @@ class TestCliEndToEnd(unittest.TestCase):
                          linear=True, pandas=False)
         out = io.StringIO()
         with mock.patch.object(cli, "DataAgent") as agent_cls:
-            agent_cls.return_value.ask.return_value = mock.Mock(
-                route="sql", statement="SELECT 1", df=sample_df(), insight="洞察",
-                chart_path="", chart_type="none", errors=[], ok=True)
+            # 线性引擎也走 run()，与状态机同一接口
+            agent_cls.return_value.run.return_value = fake_state(sample_df())
             with redirect_stdout(out):
                 code = cli.run_ask(args)
         self.assertEqual(code, 0)
