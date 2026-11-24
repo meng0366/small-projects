@@ -50,6 +50,23 @@ class TestConfigSource(unittest.TestCase):
             self.assertGreater(getattr(config, name), 0, f"{name} 必须为正数")
 
 
+class TestConfigGate(unittest.TestCase):
+    """check_config 是界面的总闸：没 Key 就停下并提示，而不是让用户问到一半才报错。"""
+
+    def test_no_key_blocks_ui(self):
+        with mock.patch.object(config, "LLM_API_KEY", ""):
+            self.assertFalse(config.check_config())
+
+    def test_placeholder_key_blocks_ui(self):
+        """`.env.example` 里的占位值不该被当成有效 Key。"""
+        with mock.patch.object(config, "LLM_API_KEY", "sk-在这里填你的key"):
+            self.assertFalse(config.check_config())
+
+    def test_real_key_passes(self):
+        with mock.patch.object(config, "LLM_API_KEY", "sk-offline-placeholder"):
+            self.assertTrue(config.check_config())
+
+
 class TestContainerFiles(unittest.TestCase):
     def test_entrypoint_exists(self):
         self.assertTrue((ROOT / "app" / "main.py").exists())

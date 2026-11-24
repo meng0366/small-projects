@@ -13,6 +13,8 @@ from unittest import mock
 
 import pandas as pd
 
+import app.config as app_config
+
 try:
     from streamlit.testing.v1 import AppTest
 except ImportError:  # 未安装 streamlit 时跳过，不影响其他测试
@@ -55,6 +57,15 @@ FAILED_STATE = {
 @unittest.skipIf(AppTest is None, "streamlit 未安装")
 class TestWebUI(unittest.TestCase):
     """界面渲染与交互的离线用例。"""
+
+    def setUp(self):
+        # 界面在没配 Key 时会在 main() 里 st.stop()，整组用例都会挂。
+        # 本机有 .env 时看不出来，CI（干净环境，没有 .env）必然全红。
+        # 这里把 Key 换成占位值，让用例只依赖"代码"而不依赖"谁的机器"；
+        # GraphAgent.run 全程被 mock，占位 Key 不会被真正拿去发请求。
+        patcher = mock.patch.object(app_config, "LLM_API_KEY", "sk-offline-placeholder")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _app(self) -> "AppTest":
         at = AppTest.from_file(APP_PATH, default_timeout=120)
