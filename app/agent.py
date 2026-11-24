@@ -14,17 +14,11 @@ from typing import Any, List, Optional
 
 import pandas as pd
 
+from app.context import AgentContext
 from app.nodes.answer import generate_insight, local_insight, summarize_result
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_code, generate_sql
-from app.schema.loader import (
-    DEFAULT_DB,
-    build_db_schema_text,
-    build_schema_text,
-    get_db_path,
-    load_catalog_terms,
-    load_dataframe,
-)
+from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
 from app.tools.sql_tool import run_sql
 
@@ -61,39 +55,38 @@ def to_frame(result: Any) -> pd.DataFrame:
 
 
 class DataAgent:
-    """数据分析 Agent 的门面类。"""
+    """数据分析 Agent 的门面类（线性编排版）。
+
+    状态机编排见 app/graph.py，两者共用同一个 AgentContext。
+    """
 
     def __init__(self, db_name: str = DEFAULT_DB, csv_name: str = "sales_orders.csv"):
-        self.csv_name = csv_name
-        self.terms = load_catalog_terms()
-        self._df: Optional[pd.DataFrame] = None
-        self._df_schema: Optional[str] = None
+        self.ctx = AgentContext(db_name=db_name, csv_name=csv_name)
 
-        # 数据库可用性：缺失时自动退回 pandas 单表模式，不影响启动
-        self.db_path: Optional[str] = None
-        self.db_schema: str = ""
-        try:
-            self.db_path = get_db_path(db_name)
-            self.db_schema = build_db_schema_text(self.db_path)
-        except FileNotFoundError:
-            pass
+    # ---- 上下文透传（保持既有调用方式不变）----
+    @property
+    def db_path(self):
+        return self.ctx.db_path
 
-    # ---- 惰性加载宽表 ----
+    @property
+    def db_schema(self) -> str:
+        return self.ctx.db_schema
+
+    @property
+    def terms(self) -> str:
+        return self.ctx.terms
+
     @property
     def df(self) -> pd.DataFrame:
-        if self._df is None:
-            self._df = load_dataframe(self.csv_name)
-        return self._df
+        return self.ctx.df
 
     @property
     def df_schema(self) -> str:
-        if self._df_schema is None:
-            self._df_schema = build_schema_text(self.df)
-        return self._df_schema
+        return self.ctx.df_schema
 
     @property
     def mode_label(self) -> str:
-        return "SQLite 多表（Text-to-SQL）" if self.db_path else "单表 CSV（Text-to-Pandas）"
+        return self.ctx.mode_label
 
     # ---- 主流程 ----
     def ask(self, question: str, with_chart: bool = True,
