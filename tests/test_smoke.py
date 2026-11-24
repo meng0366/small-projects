@@ -7,7 +7,13 @@ import unittest
 import pandas as pd
 
 from app.nodes.execute import check_safety, execute_code, UnsafeCodeError
-from app.schema.loader import build_schema_text, load_catalog_terms
+from app.schema.loader import (
+    build_schema_text,
+    load_catalog_terms,
+    get_db_path,
+    list_tables,
+    build_db_schema_text,
+)
 
 
 class TestSafety(unittest.TestCase):
@@ -69,6 +75,30 @@ class TestSchema(unittest.TestCase):
 
     def test_catalog_terms_is_text(self):
         self.assertIsInstance(load_catalog_terms(), str)
+
+
+class TestDbSchema(unittest.TestCase):
+    """SQLite 多表接入与 Schema 描述（F1.2 / F1.3）。"""
+
+    def setUp(self):
+        self.db_path = get_db_path()
+
+    def test_list_tables(self):
+        tables = list_tables(self.db_path)
+        for expected in ("orders", "customers", "products"):
+            self.assertIn(expected, tables)
+
+    def test_db_schema_has_relations_and_enums(self):
+        text = build_db_schema_text(self.db_path)
+        self.assertIn("表关系", text)
+        self.assertIn("orders.customer_id -> customers.customer_id", text)
+        # 枚举值必须显式给出，避免模型臆造字面量
+        self.assertIn("华东", text)
+        self.assertIn("笔记本", text)
+
+    def test_db_schema_mentions_row_count(self):
+        text = build_db_schema_text(self.db_path)
+        self.assertIn("3877 行", text)
 
 
 if __name__ == "__main__":
