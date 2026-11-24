@@ -76,6 +76,25 @@ class TestPeriodKey(unittest.TestCase):
         self.assertFalse(_compatible(period_key("Q1"), period_key("2025-04")))
         self.assertFalse(_compatible(period_key("2025Q2"), period_key("2024-05")))
 
+    def test_custom_span_variants(self):
+        """「3-5 月」这类自己写的区间，与季度/半年同构，也归一成 (年, 起, 止)。"""
+        cases = {
+            "3-5月": (None, 3, 5), "3 月到 5 月": (None, 3, 5),
+            "3–5月": (None, 3, 5), "3~5月": (None, 3, 5),
+            "2025年3-5月": (2025, 3, 5), "2025年3月至5月": (2025, 3, 5),
+        }
+        for text, expected in cases.items():
+            self.assertEqual(period_key(text), expected, text)
+
+    def test_invalid_span_is_not_a_span(self):
+        """倒着的区间（5-3 月）与越界（13-15 月）不能当跨度，否则会拿一个空区间去查。"""
+        for text in ("5-3月", "13-15月", "0-3月"):
+            self.assertIsNone(period_key(text), text)
+
+    def test_date_like_text_is_not_a_span(self):
+        """日期写法不能因为中间有横杠就被读成区间。"""
+        self.assertEqual(period_key("2025-06"), (2025, 6, 6))
+
 
 class TestIntentDetection(unittest.TestCase):
     def test_than_order_puts_explained_subject_current(self):
@@ -169,6 +188,90 @@ class TestQuarterIntent(unittest.TestCase):
 
         intent = detect_attribution("为什么 2025 年 6 月的销售额比 5 月高？", ENUMS)
         self.assertNotIn("跨度", describe_comparison(intent))
+
+
+class TestCustomSpanIntent(unittest.TestCase):
+    """自定义跨度：用户自己写「3-5 月」「1 月到 2 月」，不该被当成单月或两个独立月份。"""
+
+    def test_span_pair_than_order(self):
+        intent = detect_attribution("为什么 2025 年 3-5 月的销售额比 1-2 月高？", ENUMS)
+        self.assertEqual(intent["kind"], "period")
+        self.assertEqual(intent["current_key"], (2025, 3, 5))
+        self.assertEqual(intent["base_key"], (None, 1, 2))
+        self.assertEqual(intent["current"], "2025年3-5月")
+
+    def test_span_written_with_到(self):
+        intent = detect_attribution("为什么 3 月到 5 月的销售额比 1 月到 2 月高？", ENUMS)
+        self.assertEqual((intent["base_key"], intent["current_key"]),
+                         ((None, 1, 2), (None, 3, 5)))
+
+    def test_from_to_is_direction_not_span(self):
+        """「从 5 月到 6 月」是 5 月→6 月的变化，不能读成一个 5-6 月的区间。"""
+        intent = detect_attribution("从 5 月到 6 月销售额为什么上升了？", ENUMS)
+        self.assertEqual((intent["base_key"], intent["current_key"]),
+                         ((None, 5, 5), (None, 6, 6)))
+
+    def test_span_prompt_names_the_range_and_months(self):
+        """提示词要说清"这一段有几个月"，否则模型容易只筛最后一个边界月。"""
+        from app.tools.attribution import describe_comparison
+
+        intent = detect_attribution("为什么 2025 年 3-5 月的销售额比 1-2 月高？", ENUMS)
+        prompt = describe_comparison(intent)
+        self.assertIn("跨度", prompt)
+        self.assertIn("3 个月", prompt)
+        self.assertIn("'2025-04'", prompt)      # 中间那个月最能看出是否展开
+        self.assertIn("2025年3-5月", prompt)
+
+    def test_span_previous_window_across_year_is_not_guessed(self):
+        """「3-5 月」的前一段是去年 12 月–今年 2 月，跨年表示不了，宁可不做归因。
+
+        拼一个起止颠倒的假区间去和月份行对号，比"不做归因"糟得多。
+        """
+        from app.tools.attribution import _previous_period
+
+        self.assertIsNone(_previous_period((2025, 3, 5)))
+        self.assertEqual(_previous_period((2025, 4, 6)), (2025, 1, 3))
+        self.assertIsNone(detect_attribution("为什么 3-5 月的销售额下降了？", ENUMS))
+
+
+def custom_span_crosstab() -> pd.DataFrame:
+    """「月份 × 品类」交叉表：1-2 月合计 100，3-5 月合计 130（手机 +30、笔记本持平）。"""
+    rows = [
+        ("2025-01", "手机", 20.0), ("2025-01", "笔记本", 30.0),
+        ("2025-02", "手机", 10.0), ("2025-02", "笔记本", 40.0),
+        ("2025-03", "手机", 15.0), ("2025-03", "笔记本", 25.0),
+        ("2025-04", "手机", 20.0), ("2025-04", "笔记本", 30.0),
+        ("2025-05", "手机", 25.0), ("2025-05", "笔记本", 15.0),
+    ]
+    return pd.DataFrame(rows, columns=["月份", "品类", "销售额"])
+
+
+class TestCustomSpanDecompose(unittest.TestCase):
+    """自定义区间的拆解：对比列是逐月的行，要把区间内的月份都归到同一侧。"""
+
+    def setUp(self):
+        self.intent = detect_attribution("为什么 2025 年 3-5 月的销售额比 1-2 月高？", ENUMS)
+
+    def test_months_in_range_roll_into_one_side(self):
+        att = decompose(custom_span_crosstab(), self.intent)
+        self.assertTrue(att["ok"], att.get("reason"))
+        self.assertEqual(att["base_total"], 100.0)
+        self.assertEqual(att["current_total"], 130.0)
+        self.assertEqual(att["delta"], 30.0)
+
+    def test_contributions_close(self):
+        att = decompose(custom_span_crosstab(), self.intent)
+        self.assertEqual(set(att["table"]["维度"]), {"手机", "笔记本"})
+        self.assertAlmostEqual(float(att["table"]["贡献%"].sum()), 100.0, places=1)
+
+    def test_months_outside_range_are_ignored(self):
+        """区间外的月份（这里补一个 6 月）不能混进来，否则两个数都会变大。"""
+        frame = pd.concat([custom_span_crosstab(),
+                           pd.DataFrame([("2025-06", "手机", 999.0)],
+                                        columns=["月份", "品类", "销售额"])],
+                          ignore_index=True)
+        att = decompose(frame, self.intent)
+        self.assertEqual(att["current_total"], 130.0)
 
 
 def quarter_crosstab() -> pd.DataFrame:

@@ -17,6 +17,7 @@ from app.tools.scope_guard import (check_scope, extract_anchors, looks_like_sql,
 SQL_2024 = ("SELECT * FROM orders WHERE strftime('%Y-%m', order_date) = '2024-03' LIMIT 100")
 SQL_2025 = ("SELECT * FROM orders WHERE strftime('%Y-%m', order_date) = '2025-03' LIMIT 100")
 QUESTION = "2024 年 3 月的订单明细有哪些？"
+SPAN_QUESTION = "为什么 2025 年 3-5 月的销售额比 1-2 月高？"
 
 
 def _enums():
@@ -48,6 +49,31 @@ class TestScopeGuard(unittest.TestCase):
         sql = ("SELECT * FROM orders WHERE order_date >= '2024-03-01' "
                "AND order_date < '2024-04-01'")
         self.assertEqual(check_scope(QUESTION, sql, _enums()), [])
+
+    def test_month_span_is_one_anchor(self):
+        """「3-5 月」是一个区间锚点，里面的 5 月不再单独算一条。"""
+        anchors = extract_anchors("为什么 2025 年 3-5 月的销售额比 1-2 月高？", _enums())
+        self.assertEqual(anchors["spans"], [(3, 5), (1, 2)])
+        self.assertEqual(anchors["months"], [])
+        self.assertEqual(anchors["years"], ["2025"])
+
+    def test_expanded_span_is_fine(self):
+        sql = ("SELECT 1 FROM orders WHERE strftime('%Y-%m', order_date) IN "
+               "('2025-03','2025-04','2025-05','2025-01','2025-02')")
+        self.assertEqual(check_scope(SPAN_QUESTION, sql, _enums()), [])
+
+    def test_span_as_date_range_is_fine(self):
+        """上界写成「下一个月 1 日」是常见写法，此时末月不以 -05 出现，不能判成少了 5 月。"""
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2025-03-01' "
+               "AND order_date < '2025-06-01' "
+               "AND order_date >= '2025-01-01' AND order_date < '2025-03-01'")
+        self.assertEqual(check_scope(SPAN_QUESTION, sql, _enums()), [])
+
+    def test_narrowed_span_is_caught(self):
+        """把 3-5 月缩成 5 月：拿到了数据也不是用户问的那一段。"""
+        sql = "SELECT 1 FROM orders WHERE strftime('%Y-%m', order_date) = '2025-05'"
+        problems = check_scope(SPAN_QUESTION, sql, _enums())
+        self.assertTrue(any("3-5" in p for p in problems), problems)
 
     def test_dropped_enum_value_is_caught(self):
         problems = check_scope("华东区域的销售额是多少？",

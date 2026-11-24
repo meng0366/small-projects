@@ -73,6 +73,16 @@ HALF_RE = re.compile(
     r"(?:(?P<h1>[上下前后])半年|H(?P<h2>[12])(?![\d]))",
     re.IGNORECASE,
 )
+# 自定义跨度：「3-5 月」「3 月到 5 月」「2025 年 3 月至 5 月」
+#
+# 末尾那个「月」是故意的：没有它，'2025-06' 这类日期写法会被当成跨度
+# （3 和 5 之间夹个横杠就能命中），把一段日期误读成区间。
+SPAN_RE = re.compile(
+    r"(?:(?P<y>\d{4})\s*年\s*)?"
+    r"(?P<s>\d{1,2}|[一二三四五六七八九十两]{1,3})\s*月?\s*"
+    r"[到至\-–—~～]\s*"
+    r"(?P<e>\d{1,2}|[一二三四五六七八九十两]{1,3})\s*月"
+)
 
 CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -120,6 +130,14 @@ def period_key(text) -> Optional[tuple]:
         half = m.group("h1") or m.group("h2")
         first = str(half) in ("上", "前", "1")
         return (year, 1, 6) if first else (year, 7, 12)
+
+    # 「3-5 月」这类自定义跨度与季度/半年同构，都当成 (年, 起, 止)
+    m = SPAN_RE.fullmatch(s)
+    if m:
+        start, end = cn_to_int(m.group("s")), cn_to_int(m.group("e"))
+        if start and end and 1 <= start <= end <= 12:
+            year = int(m.group("y")) if m.group("y") else None
+            return year, start, end
 
     m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})(?:[-/.]\d{1,2})?", s)
     if m:
@@ -193,9 +211,11 @@ def _compatible(a: tuple, b: tuple) -> bool:
 def _find_periods(text: str) -> list:
     """找出问题里出现的时段，按出现位置排序（重叠的取更长的那段）。
 
-    季度/半年也在这里识别：'Q2 比 Q1' 里的两个 Q 各是一段跨度。
+    季度 / 半年 / 自定义跨度（「3-5 月」）都在这里识别：「Q2 比 Q1」是两个季度，
+    「3-5 月比 1-2 月」是两个自定义区间，各是一段跨度。
     重叠处理很关键 —— '2025年Q2' 会同时命中「2025年」和「Q2」，
-    保留更长的那一条，否则一个时段会被算成两个。
+    '2025年3-5月' 会同时命中「2025年」「3月」「5月」，保留最长的那一条，
+    否则一个时段会被算成两个、三个。
     """
     hits = []
     for m in ISO_PERIOD_RE.finditer(text):
@@ -222,6 +242,17 @@ def _find_periods(text: str) -> list:
         year = int(m.group("y")) if m.group("y") else None
         hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0).strip(),
                      "key": (year, 1, 6) if first else (year, 7, 12)})
+    for m in SPAN_RE.finditer(text):
+        start, end = cn_to_int(m.group("s")), cn_to_int(m.group("e"))
+        if not start or not end or not 1 <= start <= end <= 12:
+            continue                      # 「5-3 月」这种倒着的区间不当跨度
+        if text[:m.start()].rstrip().endswith("从"):
+            # 「从 5 月到 6 月」是方向不是区间：用户要的是 5 月 → 6 月的变化，
+            # 按区间读会变成「5-6 月 vs 3-4 月」，答成了另一个问题。
+            continue
+        year = int(m.group("y")) if m.group("y") else None
+        hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0).strip(),
+                     "key": (year, start, end)})
     for m in YEAR_ONLY_RE.finditer(text):
         hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0),
                      "key": (int(m.group(1)), None, None)})
@@ -273,8 +304,11 @@ def _previous_period(key: tuple) -> Optional[tuple]:
         prev_end += 12
         prev_year = (year - 1) if year else None
     prev_start = prev_end - length + 1
-    if prev_start < 1:           # 只有跨度 ≥ 12 个月才会走到这里，稳妥处理
-        prev_start += 12
+    if prev_start < 1:
+        # 前一段跨了年（「3-5 月」的前一段是去年 12 月–今年 2 月），
+        # 而 (年, 起, 止) 只能表示同一年内的跨度。宁可返回 None 不做归因，
+        # 也不能拼出一个起止颠倒的假区间去和月份行对号。
+        return None
     return prev_year, prev_start, prev_end
 
 
@@ -784,25 +818,25 @@ def format_attribution(att: dict) -> str:
 
 
 def _span_hint(intent: dict) -> str:
-    """季度/半年是跨度，提示模型把每个时段展开成月份 —— 只说"Q1"它可能只筛一个月。"""
+    """跨度（季度 / 半年 / 自定义区间）提示模型把每个时段展开成月份。
+
+    只说"Q1"或"3-5 月"，模型很可能只筛一个边界月 —— 那答的就不是这一段了。
+    """
     keys = [intent.get("base_key"), intent.get("current_key")]
     spans = [k for k in keys if k and _span_len(k) > 1]
     if not spans:
         return ""
     sample = next((k for k in spans if k[0]), spans[0])   # 有年份的那段更适合当示例
     months = list(range(sample[1], sample[2] + 1))
-    quarter = _quarter_of(sample)
-    if quarter:
-        tail = (f"对比列用月份（每段多行）或直接用季度（如 '{sample[0]}Q{quarter}'）都可以。"
-                if sample[0] else "对比列用月份（每段多行）或直接用季度都可以。")
-    else:
-        tail = "对比列用月份（每段多行）或直接用半年标签都可以。"
+    label = _period_label(sample)
     if sample[0]:
         sample_sql = "、".join(f"'{sample[0]}-{m:02d}'" for m in months)
-        return (f"注意：问题里的时段是**跨度**（季度/半年），不是单月。SQL 要把每个时段"
-                f"展开成对应月份来筛，例如 {sample_sql}；{tail}")
-    return (f"注意：问题里的时段是**跨度**（季度/半年），不是单月。SQL 要把每个时段展开成"
-            f"对应月份来筛（如 {months[0]:02d}~{months[-1]:02d} 这 {len(months)} 个月），{tail}")
+        where = f"例如 {sample_sql}"
+    else:
+        where = f"例如 {months[0]:02d}~{months[-1]:02d} 这 {len(months)} 个月"
+    return (f"注意：问题里的时段是**跨度**（「{label}」，共 {len(months)} 个月），不是单月。"
+            f"SQL 要把每个时段展开成对应月份来筛，{where}；"
+            f"对比列用月份（每段多行），或直接用「{label}」这样的时段标签都可以。")
 
 
 def describe_comparison(intent: dict) -> str:

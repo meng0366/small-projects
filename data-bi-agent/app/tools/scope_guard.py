@@ -14,7 +14,7 @@
 改年份/改月份/删掉用户明确要求的取值，都不是放宽，是换了个问题。
 
 提示词已同步收紧，但**提示词只能降概率**，所以这里再用代码兜一层：
-重试生成的语句里，用户原话中的年份、月份、枚举取值必须仍然在。
+重试生成的语句里，用户原话中的年份、月份（含「3-5 月」这种区间）、枚举取值必须仍然在。
 """
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ from typing import List, Optional
 
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 _MONTH_RE = re.compile(r"(?<!\d)(1[0-2]|0?[1-9])\s*月")
+# 自定义跨度（「3-5 月」「3 月到 5 月」）。要求末尾有「月」，否则 '2025-06'
+# 这类日期写法会被当成区间。只认数字月份：中文月份的跨度在归因里另有一套解析，
+# 这里守的是"用户写下的范围有没有被换掉"，抓不到宁可放过（漏判优于误拦）。
+_SPAN_RE = re.compile(
+    r"(?<!\d)(1[0-2]|0?[1-9])\s*月?\s*[到至\-–—~～]\s*(1[0-2]|0?[1-9])\s*月")
 _SQL_HEAD_RE = re.compile(r"(?is)^\s*(?:select|with)\b")
 _DEFER_RE = re.compile(r"(?is)^\s*DEFER\b\s*[:：]?\s*(.+)$")
 
@@ -65,10 +70,15 @@ def parse_defer(statement: str) -> Optional[str]:
 
 
 def extract_anchors(question: str, enums: Optional[list] = None) -> dict:
-    """抽出用户原话里"不能动"的条件：年份、月份、枚举取值。"""
+    """抽出用户原话里"不能动"的条件：年份、月份区间、枚举取值。"""
     text = question or ""
+    spans = [(int(a), int(b)) for a, b in _SPAN_RE.findall(text) if int(a) <= int(b)]
+    # 跨度里的月份不再单算锚点：'3-5 月' 会命中「5 月」，若既按单月又按区间各查一遍，
+    # 区间被正常展开成三个月反而会被报"找不到 5 月"（模型爱把上界写成下一个月 1 日）。
+    rest = _SPAN_RE.sub(" ", text)
+
     years = sorted(set(_YEAR_RE.findall(text)))
-    months = sorted({int(m) for m in _MONTH_RE.findall(text)})
+    months = sorted({int(m) for m in _MONTH_RE.findall(rest)})
 
     values = []
     for enum in enums or []:
@@ -80,7 +90,7 @@ def extract_anchors(question: str, enums: Optional[list] = None) -> dict:
                     "label": enum.get("label") or enum.get("column") or "取值",
                     "value": value,
                 })
-    return {"years": years, "months": months, "values": values}
+    return {"years": years, "months": months, "spans": spans, "values": values}
 
 
 def _month_present(month: int, body: str) -> bool:
@@ -92,6 +102,19 @@ def _month_present(month: int, body: str) -> bool:
     tokens = (f"-{month:02d}", f"-{month}", f"{month:02d}-", f"'{month:02d}'",
               f"{month}月", f"{month:02d}月")
     return any(token in body for token in tokens)
+
+
+def _span_present(start: int, end: int, body: str) -> bool:
+    """一段月份区间是否还在语句里。
+
+    两种等价写法都要放行，否则会把正确结果拦掉：
+    - 逐月展开：IN ('2025-03','2025-04','2025-05')
+    - 日期区间：>= '2025-03-01' AND < '2025-06-01'（上界写成下一个月 1 日，
+      这时区间末月根本不会以「-05」出现在语句里）
+    """
+    if not _month_present(start, body):
+        return False
+    return _month_present(end, body) or _month_present(end % 12 + 1, body)
 
 
 def check_scope(question: str, statement: str, enums: Optional[list] = None) -> List[str]:
@@ -110,6 +133,10 @@ def check_scope(question: str, statement: str, enums: Optional[list] = None) -> 
     for month in anchors["months"]:
         if not _month_present(month, body):
             problems.append(f"你问的是 {month} 月，重试的查询里已经找不到 {month} 月")
+    for start, end in anchors["spans"]:
+        if not _span_present(start, end, body):
+            problems.append(f"你问的是 {start}-{end} 月这一段，重试的查询里已经找不到完整区间"
+                            f"（被缩成了其中一部分月份）")
     for item in anchors["values"]:
         if item["value"] not in body:
             problems.append(
