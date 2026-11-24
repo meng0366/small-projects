@@ -34,8 +34,8 @@ def make_reflect_node(ctx: AgentContext, fallback_route: str = FALLBACK_ROUTE):
             "retry_count": retry_count,
             "errors": errors,
             "route": next_route,
-            "error": None,       # 清空，避免下一轮把旧错误当成新错误
             "statement": "",
+            # 注意：不清空 error —— 下一轮 generate 要把它作为修正提示回喂给模型
         }
         if next_route != current_route:
             update["schema_info"] = ctx.db_schema if next_route == "sql" else ctx.df_schema
