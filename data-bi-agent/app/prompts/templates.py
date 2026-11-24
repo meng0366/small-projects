@@ -126,12 +126,13 @@ SYSTEM_ATTRIBUTION = """你是一名资深数据分析师，正在做**指标归
 
 请输出一条 SQL，返回一张**交叉表**，硬性规则：
 1. 只输出一条 SELECT 语句，不要解释文字，不要 markdown 代码块；
-2. 结果必须是三列，且都用中文别名：
+2. 列数与顺序以【归因要求】为准（三列或四列），列名都用中文别名：
    ① 对比列（月份或区域，如 AS 月份）
-   ② 拆解维度（业务分类字段，如 AS 品类）
-   ③ 指标（按业务术语口径计算，如 AS 销售额）
+   ② 一级拆解维度（业务分类字段，如 AS 品类）
+   ③ 二级拆解维度（**仅四列时**才有，如 AS 客户等级）
+   ④ 指标（按业务术语口径计算，如 AS 销售额）
 3. WHERE 里只保留用户指定的**那两个对比对象**，不要扩大到其他月份或区域；
-4. 必须 GROUP BY 对比列与拆解维度，**不要返回合计行**（不要 UNION 合计，不要 ROLLUP）；
+4. 必须 GROUP BY 对比列与全部拆解维度，**不要返回合计行**（不要 UNION 合计，不要 ROLLUP）；
 5. 拆解维度要选业务上最能解释差异的分类字段（品类 / 区域 / 客户等级），
    不要用订单号、客户名这类几乎每条都不同的字段（那等于没拆）；
 6. 日期字段 order_date 是 'YYYY-MM-DD' 文本：按月份筛选用
@@ -162,6 +163,20 @@ FEW_SHOT_ATTRIBUTION = [
         "JOIN products p ON o.product_id = p.product_id\n"
         "WHERE c.region IN ('华东', '华北')\n"
         "GROUP BY c.region, p.category",
+    ),
+    # 四列示例：用户点了两个维度，就要一次把两层都查出来（代码侧做二级下钻）
+    (
+        "为什么 2025 年 6 月的销售额比 5 月高？按品类和客户等级拆",
+        "SELECT strftime('%Y-%m', o.order_date) AS 月份,\n"
+        "       p.category AS 品类,\n"
+        "       c.customer_level AS 客户等级,\n"
+        "       ROUND(SUM(o.amount), 2) AS 销售额\n"
+        "FROM orders o\n"
+        "JOIN customers c ON o.customer_id = c.customer_id\n"
+        "JOIN products p ON o.product_id = p.product_id\n"
+        "WHERE strftime('%Y-%m', o.order_date) IN ('2025-05', '2025-06')\n"
+        "GROUP BY 月份, 品类, 客户等级\n"
+        "ORDER BY 月份",
     ),
 ]
 

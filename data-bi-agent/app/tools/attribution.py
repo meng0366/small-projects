@@ -151,12 +151,24 @@ def _find_periods(text: str) -> list:
     return picked
 
 
-def _dimension_hint(question: str) -> str:
-    """从问题里读出用户想按什么拆（"按品类拆" → 品类）。"""
+def _dimension_hints(question: str) -> list:
+    """从问题里读出用户想按什么拆，**按出现顺序**返回去重后的维度名。
+
+    顺序很重要：说"按品类和客户等级拆"时，品类是一级、客户等级是二级；
+    原来的实现按字典插入顺序取第一个命中，用户先说"客户等级"也会被排成品类。
+    同时点两个维度就是二级拆解（P2-3），只点一个就只做一级。
+    """
+    hits = []
     for word, dim in DIMENSION_HINTS.items():
-        if word in question:
-            return dim
-    return ""
+        start = question.find(word)
+        if start >= 0:
+            hits.append((start, dim))
+    hits.sort()
+    dims = []
+    for _, dim in hits:
+        if dim not in dims:
+            dims.append(dim)
+    return dims
 
 
 def _previous_period(key: tuple) -> Optional[tuple]:
@@ -182,6 +194,7 @@ def detect_attribution(question: str, enums: list = None) -> Optional[dict]:
     if not any(w in q for w in CAUSE_WORDS):
         return None
 
+    hints = _dimension_hints(q)
     periods = _find_periods(q)
     if len(periods) >= 2:
         first, second = periods[0], periods[1]
@@ -198,7 +211,8 @@ def detect_attribution(question: str, enums: list = None) -> Optional[dict]:
             "base": base["raw"], "current": current["raw"],
             "base_key": base["key"], "current_key": current["key"],
             "assumed": False,
-            "dimension_hint": _dimension_hint(q),
+            "dimension_hints": hints,
+            "dimension_hint": (hints or [""])[0],
         }
 
     if len(periods) == 1 and any(w in q for w in SOLO_CHANGE_WORDS):
@@ -213,7 +227,8 @@ def detect_attribution(question: str, enums: list = None) -> Optional[dict]:
                 "current": current["raw"],
                 "base_key": prev, "current_key": current["key"],
                 "assumed": True,
-                "dimension_hint": _dimension_hint(q),
+                "dimension_hints": hints,
+                "dimension_hint": (hints or [""])[0],
             }
 
     pair = _find_enum_pair(q, enums or [])
@@ -241,7 +256,8 @@ def _find_enum_pair(question: str, enums: list) -> Optional[dict]:
             "base_key": None, "current_key": None,
             "assumed": False,
             "column": group.get("column", ""),
-            "dimension_hint": "",
+            "dimension_hints": _dimension_hints(question),
+            "dimension_hint": (_dimension_hints(question) or [""])[0],
         }
     return None
 
@@ -342,11 +358,11 @@ def _pick_metric(frame: pd.DataFrame, question: str, exclude: set) -> Optional[s
     return numeric[0]
 
 
-def _pick_dimension(frame: pd.DataFrame, exclude: set, hint: str = "") -> Optional[str]:
-    """选拆解维度：低基数、非数值、能区分出多个分项。
+def _pick_dimensions(frame: pd.DataFrame, exclude: set, hints=()) -> tuple:
+    """选一级与二级拆解维度：优先用户点名的，否则一级取基数最大的可用列。
 
-    优先匹配用户点名的维度（"按品类拆"），否则取基数最大的可用列 ——
-    基数越大信息越细，但上限 30，防止订单号、客户名这类列混进来。
+    只按用户点名给二级维度、不自动猜：猜错会产出一段"看着很深入其实跑偏"的结论，
+    比只给一级更糟。用户点了两个维度但结果里只有一层时，`decompose` 会说明原因。
     """
     candidates = []
     for col in frame.columns:
@@ -356,13 +372,22 @@ def _pick_dimension(frame: pd.DataFrame, exclude: set, hint: str = "") -> Option
         if MIN_DIM_CARDINALITY <= nunique <= MAX_DIM_CARDINALITY:
             candidates.append((str(col), nunique))
     if not candidates:
-        return None
-    if hint:
-        for name, _ in candidates:
+        return None, None
+
+    names = [name for name, _ in sorted(candidates, key=lambda item: -item[1])]
+    matched = []
+    for hint in hints:
+        if not hint:
+            continue
+        for name in names:
+            if name in matched:
+                continue
             if hint in name or name in hint:
-                return name
-    candidates.sort(key=lambda item: -item[1])
-    return candidates[0][0]
+                matched.append(name)
+                break
+    if not matched:
+        return names[0], None
+    return matched[0], (matched[1] if len(matched) > 1 else None)
 
 
 def _is_ratio_metric(metric: str) -> bool:
@@ -399,7 +424,9 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
     if not metric:
         return {"ok": False, "reason": "结果里没有数值列，无法比较变化"}
 
-    dim = _pick_dimension(frame, exclude={comp_col, metric}, hint=intent.get("dimension_hint", ""))
+    hints = [h for h in (intent.get("dimension_hints")
+                         or [intent.get("dimension_hint", "")]) if h]
+    dim, dim2 = _pick_dimensions(frame, exclude={comp_col, metric}, hints=hints)
     if not dim:
         return {"ok": False,
                 "reason": "结果只有对比双方的总量，没有拆到业务维度（需要一张"
@@ -438,12 +465,42 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
     # 比率类指标的分项差异不可相加，占比没有意义 → 只按变化幅度排序。
     # 分子乘上总变化的方向：总额在跌时，跟着跌的项应显示为正贡献，
     # 否则"占降幅 43%"会被写成"-43%"，读起来像在说反话。
+    direction = 1 if delta >= 0 else -1
     if additive and delta != 0:
-        direction = 1 if delta > 0 else -1
         table["贡献%"] = (table["变化"] * direction / abs(delta) * 100).round(1)
 
     table = table.reindex(table["变化"].abs().sort_values(ascending=False).index)
     table = table.reset_index(drop=True)
+
+    # 二级拆解：只在用户点名了第二个维度、且结果里真有这一列时才做。
+    # 下钻对象取变化最大的那一项 —— 归因要回答"谁在动"，不是把所有项都拆一遍。
+    drill = None
+    if dim2 and not table.empty:
+        top_item = str(table.iloc[0]["维度"])
+        item_delta = float(table.iloc[0]["变化"])
+        item_rows = sub[sub[dim] == top_item].copy()
+        item_rows[dim2] = item_rows[dim2].fillna("(未分类)").astype(str)
+        pivot2 = (item_rows.groupby([dim2, "__side__"], dropna=False)[metric]
+                  .sum().unstack("__side__").reindex(columns=["base", "current"]).fillna(0.0))
+        drill_table = pd.DataFrame({
+            "维度": pivot2.index.astype(str),
+            "基期": pivot2["base"].round(2).to_numpy(),
+            "本期": pivot2["current"].round(2).to_numpy(),
+        })
+        drill_table["变化"] = (drill_table["本期"] - drill_table["基期"]).round(2)
+        if additive and delta != 0:
+            drill_table["贡献%"] = (drill_table["变化"] * direction / abs(delta) * 100).round(1)
+        drill_table = drill_table.reindex(
+            drill_table["变化"].abs().sort_values(ascending=False).index).reset_index(drop=True)
+        drilled_total = float(drill_table["变化"].sum())
+        drill = {
+            "dim": str(dim2),
+            "item": top_item,
+            "item_delta": round(item_delta, 2),
+            "table": drill_table,
+            # 二级分项加总必须回到该项的变化，否则说明下钻时漏了行
+            "closure_ok": abs(drilled_total - item_delta) <= 0.02,
+        }
 
     notes = [year_note] if year_note else []
     if missing_base:
@@ -462,10 +519,18 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
     if intent.get("assumed"):
         notes.append(f"问题里只提到一个时段，默认与上一期（{intent.get('base')}）比较")
 
+    # 用户点名的第二层若在结果里找不到，说明为什么没做二级拆解 ——
+    # 静默少给一层，用户会以为"已经拆到最细了"
+    asked = [h for h in hints if h and str(comp_col) not in h]
+    if len(asked) >= 2 and not dim2:
+        notes.append(f"问题里点了「{asked[0]}」「{asked[1]}」两层，"
+                     f"但结果里只有「{dim}」这一层能拆，已按单层给出")
+
     result = {
         "ok": True,
         "compare_col": str(comp_col),
         "dim": str(dim),
+        "dim2": str(dim2 or ""),
         "metric": str(metric),
         "base_label": str(intent.get("base")),
         "current_label": str(intent.get("current")),
@@ -474,6 +539,7 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
         "delta": delta,
         "pct": round(delta / base_total, 4) if base_total else None,
         "table": table,
+        "drill": drill,
         "additive": additive,
         "notes": notes,
     }
@@ -551,6 +617,33 @@ def format_attribution(att: dict) -> str:
             lines.append(f"{label}（{len(rows)} 项，合计 {rows['变化'].sum():+,.2f}）：")
             lines.extend(fmt_rows(rows))
 
+    # 二级拆解单独成段：一级结论已经给出"哪一项在动"，这里回答"这一项内部是谁在动"。
+    drill = att.get("drill")
+    if drill:
+        # 二级占比沿用"对总额的贡献"这一口径（与一级同一把尺子），
+        # 所以它不会加到 100%，而是加到"该项自己的占比" —— 说清楚免得被当成算错
+        share_note = "（各行占比仍是对总额的贡献）" if att.get("additive") else ""
+        lines.append("")
+        lines.append(f"二级拆解：把变化最大的「{drill['item']}」再按「{drill['dim']}」拆开"
+                     f"{share_note}：")
+        for _, row in drill["table"].iterrows():
+            item = (f"  · {row['维度']}  {row['变化']:+,.2f}"
+                    f"（基期 {row['基期']:,.2f} → 本期 {row['本期']:,.2f}）")
+            share = row.get("贡献%")
+            if att.get("additive") and share is not None and not pd.isna(share):
+                if share >= 0:
+                    item += f"，占总{'增幅' if delta > 0 else '降幅'}的 {share:.1f}%"
+                else:
+                    item += f"，对冲了 {abs(share):.1f}%"
+            lines.append(item)
+        drilled = drill["table"]["变化"].sum()
+        if drill.get("closure_ok"):
+            lines.append(f"  校验：以上分项加总 = {drilled:+,.2f}，"
+                         f"与「{drill['item']}」本身的变化 {drill['item_delta']:+,.2f} 一致。")
+        else:
+            lines.append(f"  注意：以上分项加总 {drilled:+,.2f} 与「{drill['item']}」本身的"
+                         f"变化 {drill['item_delta']:+,.2f} 对不上，二级拆解仅供参考。")
+
     lines.append("")
     if att.get("additive"):
         lines.append(f"校验：{len(table)} 个{dim}分项的变化加总 = "
@@ -568,13 +661,23 @@ def describe_comparison(intent: dict) -> str:
     """把意图写成一句给模型看的说明：谁跟谁比、按什么拆。
 
     只说"为什么 6 月比 5 月高"时，模型可能只返回两行总数 —— 那样的表拆不开。
-    在提问末尾把"要三列交叉表"说清楚，比在 system 里写十遍规则都有效。
+    在提问末尾把"要几列交叉表"说清楚，比在 system 里写十遍规则都有效。
+
+    用户点名两个维度时要求**四列**（对比列 × 一级 × 二级 × 指标）：
+    多要一列就能在代码侧做二级下钻，而不必再发一次模型调用。
     """
     base, current = intent.get("base"), intent.get("current")
-    dim = intent.get("dimension_hint") or "最能解释差异的业务分类字段"
+    dims = [d for d in (intent.get("dimension_hints")
+                        or [intent.get("dimension_hint", "")]) if d]
     compare = "月份" if intent.get("kind") == "period" else "用户提到的对比维度"
+    if len(dims) >= 2:
+        shape = (f"「{compare} × {dims[0]} × {dims[1]} × 指标」四列交叉表"
+                 f"（{dims[0]} 为一级维度、{dims[1]} 为二级维度）")
+    else:
+        dim = dims[0] if dims else "最能解释差异的业务分类字段"
+        shape = f"「{compare} × {dim} × 指标」三列交叉表"
     return (f"\n\n【归因要求】以「{base}」为参照、「{current}」为被解释对象；"
-            f"结果需要「{compare} × {dim} × 指标」三列交叉表，不要只给两行总数。")
+            f"结果需要{shape}，不要只给两行总数。")
 
 
 def attribution_chart_frame(att: dict) -> Optional[pd.DataFrame]:

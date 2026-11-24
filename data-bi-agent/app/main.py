@@ -196,6 +196,15 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
                        f"「{att.get('base_label')}」，按「{att.get('dim')}」拆解")
             st.dataframe(att["table"], width="stretch",
                          height=min(420, 42 + 35 * min(len(att["table"]), 10)))
+            drill = att.get("drill")
+            if drill:
+                # 二级拆解是"顺着最大的一项往下看"，默认收起，不抢一级结论的位置
+                with st.expander(f"下钻：「{drill.get('item')}」按「{drill.get('dim')}」拆开",
+                                 expanded=False):
+                    st.dataframe(drill["table"], width="stretch",
+                                 height=min(320, 42 + 35 * min(len(drill["table"]), 8)))
+                    if not drill.get("closure_ok"):
+                        st.caption("分项加总与该分项本身的变化不一致，仅供参考。")
         else:
             st.dataframe(df, width="stretch",
                          height=min(420, 42 + 35 * min(len(df), 10)))

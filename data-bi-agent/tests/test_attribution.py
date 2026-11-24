@@ -32,6 +32,19 @@ def crosstab() -> pd.DataFrame:
     })
 
 
+def crosstab_two_dims() -> pd.DataFrame:
+    """「月份 × 品类 × 客户等级」四列交叉表：6 月比 5 月少 20，笔记本拖了 25。"""
+    rows = [
+        ("2025-05", "手机", "普通客户", 10.0), ("2025-05", "手机", "会员客户", 20.0),
+        ("2025-05", "笔记本", "普通客户", 40.0), ("2025-05", "笔记本", "会员客户", 20.0),
+        ("2025-05", "平板", "普通客户", 10.0), ("2025-05", "平板", "会员客户", 5.0),
+        ("2025-06", "手机", "普通客户", 10.0), ("2025-06", "手机", "会员客户", 20.0),
+        ("2025-06", "笔记本", "普通客户", 20.0), ("2025-06", "笔记本", "会员客户", 15.0),
+        ("2025-06", "平板", "普通客户", 12.0), ("2025-06", "平板", "会员客户", 8.0),
+    ]
+    return pd.DataFrame(rows, columns=["月份", "品类", "客户等级", "销售额"])
+
+
 class TestPeriodKey(unittest.TestCase):
     def test_variants(self):
         cases = {
@@ -163,6 +176,66 @@ class TestDecompose(unittest.TestCase):
         self.assertTrue(any("天数" in n for n in att["notes"]))
 
 
+class TestTwoDimDrill(unittest.TestCase):
+    """二级拆解：用户点两个维度时，对变化最大的一项再拆一层。"""
+
+    def _intent(self, q="为什么 6 月销售额比 5 月低？按品类和客户等级拆"):
+        return detect_attribution(q, ENUMS)
+
+    def test_hints_follow_text_order(self):
+        """先说哪个哪个是一级 —— 不能按字典顺序碰运气。"""
+        intent = detect_attribution("为什么 6 月销售额比 5 月低？按客户等级和品类拆", ENUMS)
+        self.assertEqual(intent["dimension_hints"], ["客户等级", "品类"])
+        self.assertEqual(intent["dimension_hint"], "客户等级")
+
+    def test_single_hint_stays_single(self):
+        intent = detect_attribution("为什么 6 月销售额比 5 月低？按品类拆", ENUMS)
+        self.assertEqual(intent["dimension_hints"], ["品类"])
+
+    def test_drill_happens_on_largest_item(self):
+        att = decompose(crosstab_two_dims(), self._intent())
+        self.assertTrue(att["ok"])
+        self.assertEqual(att["dim"], "品类")
+        self.assertEqual(att["dim2"], "客户等级")
+        drill = att["drill"]
+        self.assertIsNotNone(drill)
+        self.assertEqual(drill["item"], "笔记本")     # 变化 -25，绝对值最大
+        self.assertEqual(set(drill["table"]["维度"]), {"普通客户", "会员客户"})
+
+    def test_drill_closes_back_to_item(self):
+        """二级分项加总必须回到该项的变化，否则下钻时漏了行。"""
+        att = decompose(crosstab_two_dims(), self._intent())
+        drill = att["drill"]
+        self.assertAlmostEqual(drill["table"]["变化"].sum(), drill["item_delta"], places=2)
+        self.assertTrue(drill["closure_ok"])
+
+    def test_drill_share_uses_total_direction(self):
+        """总额在跌：跟着跌的二级分项显示为正贡献（占总降幅的百分比）。"""
+        att = decompose(crosstab_two_dims(), self._intent())
+        row = att["drill"]["table"].iloc[0]
+        self.assertEqual(row["维度"], "普通客户")
+        self.assertAlmostEqual(row["贡献%"], 100.0, places=1)   # -20 / 总降幅 20
+
+    def test_no_second_dim_means_no_drill(self):
+        att = decompose(crosstab(), detect_attribution("为什么 6 月销售额比 5 月高？按品类拆", ENUMS))
+        self.assertTrue(att["ok"])
+        self.assertIsNone(att["drill"])
+        self.assertEqual(att["dim2"], "")
+
+    def test_requested_two_layers_but_missing_explains(self):
+        """点了两层却只有一层数据：要说明，别让用户以为已经拆到最细。"""
+        att = decompose(crosstab(), self._intent("为什么 6 月销售额比 5 月高？按品类和客户等级拆"))
+        self.assertTrue(att["ok"])
+        self.assertIsNone(att["drill"])
+        self.assertTrue(any("两层" in n for n in att["notes"]))
+
+    def test_summary_has_drill_block(self):
+        text = format_attribution(decompose(crosstab_two_dims(), self._intent()))
+        self.assertIn("二级拆解", text)
+        self.assertIn("笔记本", text)
+        self.assertIn("加总", text)
+
+
 class TestFormat(unittest.TestCase):
     def _att(self):
         """总额下降 10：手机 -20、平板 +10（有涨有跌，两个方向都要能讲）。"""
@@ -224,6 +297,14 @@ SQL_TOTALS_ONLY = """SELECT strftime('%Y-%m', o.order_date) AS 月份,
 FROM orders o
 WHERE strftime('%Y-%m', o.order_date) IN ('2025-05','2025-06')
 GROUP BY 月份"""
+SQL_FOUR_COLUMNS = """SELECT strftime('%Y-%m', o.order_date) AS 月份,
+       p.category AS 品类, c.customer_level AS 客户等级,
+       ROUND(SUM(o.amount), 2) AS 销售额
+FROM orders o
+JOIN customers c ON o.customer_id = c.customer_id
+JOIN products p ON o.product_id = p.product_id
+WHERE strftime('%Y-%m', o.order_date) IN ('2025-05','2025-06')
+GROUP BY 月份, 品类, 客户等级"""
 
 
 class TestGraphIntegration(unittest.TestCase):
@@ -260,6 +341,18 @@ class TestGraphIntegration(unittest.TestCase):
         self.assertIn("没能拆出归因", state["answer"])
         self.assertIsNotNone(state["result"])
         self.assertEqual(len(state["result"]), 2)
+
+    def test_two_dimension_question_drills_into_answer(self):
+        """点两个维度 → 拿四列表 → 一级拆解 + 二级下钻，结论里两段都要有。"""
+        state, _, _ = self._run(
+            "为什么 2025 年 6 月的销售额比 5 月低？按品类和客户等级拆", SQL_FOUR_COLUMNS)
+        att = state["attribution"]
+        self.assertTrue(att["ok"])
+        self.assertIsNotNone(att["drill"])
+        self.assertEqual(att["dim"], "品类")
+        self.assertEqual(att["drill"]["dim"], "客户等级")
+        self.assertIn("二级拆解", state["answer"])
+        self.assertTrue(att["drill"]["closure_ok"])
 
 
 if __name__ == "__main__":

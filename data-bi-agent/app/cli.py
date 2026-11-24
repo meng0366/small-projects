@@ -264,6 +264,11 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
         print(f"\n[归因] 「{att.get('current_label')}」对比「{att.get('base_label')}」，"
               f"按「{att.get('dim')}」拆解（指标：{att.get('metric')}）")
         print(render(att["table"], "table"))
+        drill = att.get("drill")
+        if drill:
+            print(f"\n[归因·下钻] 把变化最大的「{drill.get('item')}」"
+                  f"再按「{drill.get('dim')}」拆开")
+            print(render(drill["table"], "table"))
 
     chart_path = state.get("chart_path") or ""
     chart_type = state.get("chart_type") or "none"
@@ -300,6 +305,15 @@ def _build_payload(state: dict, question: str) -> dict:
             "rows": json.loads(render(att["table"], "json")),
             "notes": att.get("notes") or [],
         }
+        drill = att.get("drill")
+        if drill:
+            attribution["drill"] = {
+                "dimension": drill.get("dim"),
+                "item": drill.get("item"),
+                "item_delta": drill.get("item_delta"),
+                "closure_ok": drill.get("closure_ok"),
+                "rows": json.loads(render(drill["table"], "json")),
+            }
     return {
         "question": question,
         "rewritten": state.get("rewritten_question") or "",

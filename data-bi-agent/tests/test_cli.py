@@ -438,5 +438,50 @@ class TestCliEndToEnd(unittest.TestCase):
         self.assertTrue(payload["mode"])
 
 
+class TestAttributionOutput(unittest.TestCase):
+    """归因在命令行 / JSON 里的展示（二级拆解要单独成段，不能糊进一级表）。"""
+
+    def _att(self) -> dict:
+        return {
+            "ok": True, "dim": "品类", "dim2": "客户等级", "metric": "销售额",
+            "base_label": "5月", "current_label": "6月",
+            "base_total": 10.0, "current_total": 20.0, "delta": 10.0,
+            "pct": 1.0, "additive": True, "notes": [],
+            "table": pd.DataFrame({"维度": ["手机"], "基期": [10.0], "本期": [20.0],
+                                   "变化": [10.0], "贡献%": [100.0]}),
+            "drill": {
+                "dim": "客户等级", "item": "手机", "item_delta": 10.0, "closure_ok": True,
+                "table": pd.DataFrame({"维度": ["战略客户"], "基期": [5.0], "本期": [15.0],
+                                       "变化": [10.0], "贡献%": [100.0]}),
+            },
+        }
+
+    def test_payload_carries_drill(self):
+        payload = cli._build_payload(
+            {"attribution": self._att(), "result": pd.DataFrame({"维度": ["手机"]})}, "q")
+        drill = payload["attribution"]["drill"]
+        self.assertEqual(drill["dimension"], "客户等级")
+        self.assertEqual(drill["item"], "手机")
+        self.assertTrue(drill["closure_ok"])
+        self.assertEqual(drill["rows"][0]["变化"], 10.0)
+
+    def test_payload_without_drill_keeps_single_level(self):
+        att = self._att()
+        att.pop("drill")
+        payload = cli._build_payload({"attribution": att,
+                                      "result": pd.DataFrame({"维度": ["手机"]})}, "q")
+        self.assertNotIn("drill", payload["attribution"])
+
+    def test_human_output_prints_drill_block(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli._print_human({"attribution": self._att(),
+                              "result": pd.DataFrame({"维度": ["手机"]})}, "q")
+        text = out.getvalue()
+        self.assertIn("[归因]", text)
+        self.assertIn("[归因·下钻]", text)
+        self.assertIn("战略客户", text)
+
+
 if __name__ == "__main__":
     unittest.main()
