@@ -22,6 +22,7 @@ from unittest import mock
 import app.agent as A
 import app.graph as G
 import app.logging_utils as lu
+import pandas as pd
 from app.cli import EXIT_OK, EXIT_USAGE, _show_trace
 
 GOOD_SQL = ("SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 "
@@ -204,6 +205,49 @@ class TestGraphTrace(TraceLogCase):
         self.assertEqual(events[-1]["stage"], "understand")
         self.assertTrue(events[-1]["failed"])
         self.assertIn("RuntimeError", events[-1]["error"])
+
+
+class TestTraceFields(unittest.TestCase):
+    """字段白名单（P2-2）：两套引擎共用一份，敏感内容在源头就挡住。"""
+
+    def test_statement_only_keeps_length(self):
+        fields = lu.trace_fields({"statement": "SELECT * FROM orders WHERE amount > 1"})
+        self.assertEqual(fields, {"statement_len": 37})
+        self.assertNotIn("SELECT", json.dumps(fields, ensure_ascii=False))
+
+    def test_result_only_keeps_rows(self):
+        fields = lu.trace_fields({"result": pd.DataFrame({"a": [1, 2, 3]})})
+        self.assertEqual(fields, {"rows": 3})
+
+    def test_empty_result_still_reports_zero_rows(self):
+        """rows=0 是结论（查不到数据），不能像其他零值一样被吞掉。"""
+        self.assertEqual(lu.trace_fields({"result": pd.DataFrame()}), {"rows": 0})
+
+    def test_zero_and_false_are_dropped(self):
+        fields = lu.trace_fields({"retry_count": 0, "defer": False, "error": "",
+                                  "chart_type": "", "route": "sql"})
+        self.assertEqual(fields, {"route": "sql"})
+
+    def test_unknown_keys_are_dropped(self):
+        """问题原文、结果表这类不在白名单里的键，一律不落盘。"""
+        fields = lu.trace_fields({"question": "各区域销售额", "secret": "x"}, route="sql")
+        self.assertEqual(fields, {"route": "sql"})
+
+    def test_extra_flag_passes_only_when_true(self):
+        self.assertEqual(lu.trace_fields({"route": "pandas"}, fallback=True),
+                         {"route": "pandas", "fallback": True})
+        self.assertEqual(lu.trace_fields({"route": "pandas"}, fallback=False),
+                         {"route": "pandas"})
+
+    def test_bad_value_is_skipped_not_raised(self):
+        """类型不对只跳过这个字段，不能让整条日志丢掉。"""
+        self.assertEqual(lu.trace_fields({"lessons_used": 42}), {})
+
+    def test_both_engines_use_the_same_whitelist(self):
+        """回归：状态机与线性编排不许各写一份字段映射。"""
+        self.assertFalse(hasattr(G, "_TRACE_FIELDS"))
+        self.assertFalse(hasattr(G, "_trace_fields"))
+        self.assertTrue(callable(lu.trace_fields))
 
 
 class TestLinearTrace(TraceLogCase):

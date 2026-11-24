@@ -249,7 +249,8 @@ python -m app.cli ask "各区域的销售额是多少？" --linear --no-chart
 # 汇总：成功 · 5 行 · token 未统计（线性路线） · 2.1s（线性编排）
 ```
 
-日志只记标量字段，**SQL 全文与结果表不会落盘**。
+日志只记标量字段，**SQL 全文与结果表不会落盘**；这份字段白名单集中在
+`app/logging_utils.py` 的 `trace_fields()`，状态机与线性编排共用同一份，不会各记一套。
 
 ### teach / lessons：答错一次，以后都对
 
@@ -515,7 +516,7 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 280 个用例，覆盖：
+共 288 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -530,7 +531,7 @@ python -m unittest discover -s tests -v
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
 | `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、`logs --trace` 参数、追问建议、退出码 |
-| `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、状态机的重试环与澄清分支、线性路线的顺利/回退/全失败三条链、节点异常留痕、CLI 链路输出 |
+| `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、状态机的重试环与澄清分支、线性路线的顺利/回退/全失败三条链、节点异常留痕、字段白名单（只记长度/行数、零值不写、未知键丢弃）、CLI 链路输出 |
 
 ### 持续集成
 

@@ -102,6 +102,55 @@ def log_event(trace_id: str, stage: str, **fields) -> None:
         pass
 
 
+# ---------------------------------------------------------------- 字段白名单（P2-2）
+#
+# 为什么要有白名单：日志会被翻、会被分享、会被贴进 issue。阶段事件里如果顺手把
+# state 整个 dump 进去，SQL 全文、结果表、用户原话就一起进了磁盘。
+# 所以这里只放"能回答慢在哪、卡在哪"的标量，且由代码统一过滤 ——
+# 状态机（graph）与线性编排（agent）共用这一份，避免两套引擎记出两种口径。
+
+TRACE_FIELDS = (
+    # (状态里的键, 日志字段名, 取值转换)
+    ("route", "route", str),
+    ("retry_count", "retry", int),
+    ("statement", "statement_len", lambda v: len(str(v or ""))),
+    ("result", "rows", lambda v: 0 if v is None else len(v)),
+    ("error", "error", lambda v: str(v or "")[:200]),
+    ("unknown_enum", "clarify", bool),
+    ("defer", "defer", bool),
+    ("scope_violation", "scope_violation", bool),
+    ("attribution", "attribution", lambda v: bool((v or {}).get("ok"))),
+    ("chart_type", "chart", str),
+    ("lessons_used", "lessons", len),
+    ("errors", "errors", len),
+    ("failed", "failed", bool),
+    ("fallback", "fallback", bool),
+)
+
+
+def trace_fields(values: dict = None, **extra) -> dict:
+    """按白名单挑出可落盘的字段；`extra` 用于白名单外的少量补充（如 fallback）。
+
+    - **只收标量**：语句原文只记长度，结果只记行数；不认识、没发生的键直接丢；
+    - **零值不写**：0 / False / 空串只是噪音，唯一例外是 `rows=0` —— "查不到数据"是结论；
+    - 转换失败（类型不对、对象没有长度）就跳过，日志不能因为一个字段写不进去而整条丢失。
+    """
+    merged = dict(values or {})
+    merged.update(extra or {})
+    fields = {}
+    for key, name, cast in TRACE_FIELDS:
+        if key not in merged:
+            continue
+        try:
+            value = cast(merged.get(key))
+        except Exception:
+            continue
+        if value in (0, False, "", None) and name != "rows":
+            continue          # rows=0 是有意义的（查不到数据），其余零值只是噪音
+        fields[name] = value
+    return fields
+
+
 class TokenCounter(BaseCallbackHandler):
     """统计一次问答的模型调用次数与 token 用量（成本监控用）。
 

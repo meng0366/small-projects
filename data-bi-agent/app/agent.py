@@ -20,7 +20,7 @@ from typing import Any, List, Optional
 import pandas as pd
 
 from app.context import AgentContext
-from app.logging_utils import log_event, log_run, new_trace_id
+from app.logging_utils import log_event, log_run, new_trace_id, trace_fields
 from app.nodes.answer import generate_insight, local_insight, summarize_result
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_code, generate_sql
@@ -161,11 +161,12 @@ class DataAgent:
                 res.insight = generate_insight(question, res.df)
             log_event(trace, "answer",
                       ms=round((time.perf_counter() - answered) * 1000),
-                      rows=len(res.df), chart=res.chart_type or "")
+                      **trace_fields({"result": res.df, "chart_type": res.chart_type}))
         else:
             # 两条路都没成：链尾留一行失败的 answer，否则链看起来"没走完"
-            log_event(trace, "answer", ms=0, failed=True,
-                      error=(res.errors[-1][:200] if res.errors else "没有拿到结果"))
+            log_event(trace, "answer", ms=0,
+                      **trace_fields({"error": res.errors[-1] if res.errors else "没有拿到结果"},
+                                     failed=True))
 
         log_run(
             ok=res.ok,
@@ -194,12 +195,12 @@ class DataAgent:
             res.errors.append(msg)
             log_event(trace, "generate",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="sql", failed=True, error=msg[:200])
+                      **trace_fields({"route": "sql", "error": msg}, failed=True))
             return
-        # 语句原文不落盘，只记长度 —— 日志会被翻、会被分享
+        # 语句原文不落盘，只记长度 —— 白名单在 logging_utils 里统一管这件事
         log_event(trace, "generate",
                   ms=round((time.perf_counter() - started) * 1000),
-                  route="sql", statement_len=len(sql))
+                  **trace_fields({"route": "sql", "statement": sql}))
 
         started = time.perf_counter()
         r = run_sql(sql, self.db_path)
@@ -207,13 +208,13 @@ class DataAgent:
             res.route, res.statement, res.df = "sql", r["sql"], r["df"]
             log_event(trace, "execute",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="sql", rows=len(r["df"]))
+                      **trace_fields({"route": "sql", "result": r["df"]}))
         else:
             msg = f"SQL {r['stage']} 阶段失败：{r['error']}"
             res.errors.append(msg)
             log_event(trace, "execute",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="sql", failed=True, error=msg[:200])
+                      **trace_fields({"route": "sql", "error": msg}, failed=True))
 
     def _try_pandas(self, question: str, res: AskResult, fallback: bool = False) -> None:
         trace = res.trace_id
@@ -225,13 +226,13 @@ class DataAgent:
             res.errors.append(msg)
             log_event(trace, "generate",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="pandas", failed=True, error=msg[:200],
-                      **({"fallback": True} if fallback else {}))
+                      **trace_fields({"route": "pandas", "error": msg},
+                                     failed=True, fallback=fallback))
             return
         log_event(trace, "generate",
                   ms=round((time.perf_counter() - started) * 1000),
-                  route="pandas", statement_len=len(code),
-                  **({"fallback": True} if fallback else {}))
+                  **trace_fields({"route": "pandas", "statement": code},
+                                 fallback=fallback))
 
         started = time.perf_counter()
         r = execute_code(code, self.df)
@@ -240,15 +241,15 @@ class DataAgent:
             res.df = to_frame(r["result"])
             log_event(trace, "execute",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="pandas", rows=len(res.df),
-                      **({"fallback": True} if fallback else {}))
+                      **trace_fields({"route": "pandas", "result": res.df},
+                                     fallback=fallback))
         else:
             msg = f"代码执行失败（{r['stage']}）：{r['error']}"
             res.errors.append(msg)
             log_event(trace, "execute",
                       ms=round((time.perf_counter() - started) * 1000),
-                      route="pandas", failed=True, error=msg[:200],
-                      **({"fallback": True} if fallback else {}))
+                      **trace_fields({"route": "pandas", "error": msg},
+                                     failed=True, fallback=fallback))
 
     def _attach_chart(self, question: str, res: AskResult) -> None:
         try:

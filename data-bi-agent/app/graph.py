@@ -27,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from app.agent import to_frame
 from app.config import MAX_QUESTION_CHARS
 from app.context import AgentContext
-from app.logging_utils import TokenCounter, log_event, log_run, new_trace_id
+from app.logging_utils import TokenCounter, log_event, log_run, new_trace_id, trace_fields
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_attribution_sql, generate_code, generate_sql
@@ -331,39 +331,8 @@ def route_after_understand(state: AgentState) -> str:
 #
 # 汇总行只说"最后怎么样"，看不出"慢在哪一步、重试发生在哪、错在哪一层"。
 # 这里给每个节点包一层：执行完补一行阶段事件，全部共用同一个 trace_id。
-# 用白名单挑字段 —— 绝不能把结果表或 SQL 全文写进日志（日志会被翻、会被分享）。
-
-_TRACE_FIELDS = (
-    # (状态里的键, 日志字段名, 取值转换)
-    ("route", "route", str),
-    ("retry_count", "retry", int),
-    ("statement", "statement_len", lambda v: len(str(v or ""))),
-    ("result", "rows", lambda v: 0 if v is None else len(v)),
-    ("error", "error", lambda v: str(v or "")[:200]),
-    ("unknown_enum", "clarify", bool),
-    ("defer", "defer", bool),
-    ("scope_violation", "scope_violation", bool),
-    ("attribution", "attribution", lambda v: bool((v or {}).get("ok"))),
-    ("chart_type", "chart", str),
-    ("lessons_used", "lessons", len),
-    ("errors", "errors", len),
-)
-
-
-def _trace_fields(update: dict) -> dict:
-    """只挑本次节点真正写过的键；0 / False / 空串这类"没发生"的值不写。"""
-    fields = {}
-    for key, name, cast in _TRACE_FIELDS:
-        if key not in update:
-            continue
-        try:
-            value = cast(update.get(key))
-        except Exception:
-            continue
-        if value in (0, False, "", None) and name != "rows":
-            continue          # rows=0 是有意义的（查不到数据），其余零值只是噪音
-        fields[name] = value
-    return fields
+# 记哪些字段由 `logging_utils.trace_fields()` 统一决定（白名单在那儿，
+# 线性编排也用它）—— 绝不能把结果表或 SQL 全文写进日志。
 
 
 def _traced(name: str, node):
@@ -381,7 +350,7 @@ def _traced(name: str, node):
             raise
         log_event(trace_id, name,
                   ms=round((time.perf_counter() - started) * 1000),
-                  **_trace_fields(update))
+                  **trace_fields(update))
         return update
 
     return wrapped
