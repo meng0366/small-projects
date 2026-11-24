@@ -9,6 +9,7 @@ import unittest
 import pandas as pd
 
 from app.nodes.execute import check_safety, execute_code, UnsafeCodeError
+from app.nodes.answer import local_insight, summarize_result
 from app.schema.loader import (
     build_schema_text,
     load_catalog_terms,
@@ -182,6 +183,31 @@ class TestChart(unittest.TestCase):
             path = save_chart(fig, out_dir=tmp)
             self.assertTrue(os.path.exists(path))
             self.assertGreater(os.path.getsize(path), 1000)
+
+
+class TestInsight(unittest.TestCase):
+    """结果压缩与本地兜底结论（F2.6，不调用 LLM）。"""
+
+    def setUp(self):
+        self.df = pd.DataFrame({
+            "区域": ["华东", "华南"],
+            "销售额": [100.0, 300.0],
+        })
+
+    def test_summary_contains_shape_and_sum(self):
+        text = summarize_result(self.df)
+        self.assertIn("2 行", text)
+        self.assertIn("400.00", text)      # 合计
+        self.assertIn("华南", text)         # 明细
+
+    def test_summary_empty_df(self):
+        text = summarize_result(pd.DataFrame())
+        self.assertIn("0 行", text)
+
+    def test_local_insight_names_top_item(self):
+        text = local_insight(self.df)
+        self.assertIn("华南", text)
+        self.assertIn("300.00", text)
 
 
 if __name__ == "__main__":
