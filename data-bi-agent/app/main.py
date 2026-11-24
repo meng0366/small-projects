@@ -27,12 +27,14 @@ from app.config import LLM_MODEL, MAX_QUESTIONS_PER_SESSION, check_config  # noq
 from app.context import AgentContext  # noqa: E402
 from app.graph import GraphAgent  # noqa: E402
 from app.schema.loader import list_tables  # noqa: E402
+from app.tools.attribution import attribution_chart_frame  # noqa: E402
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart  # noqa: E402
 from app.tools.sql_tool import run_sql  # noqa: E402
 
 EXAMPLE_QUESTIONS = [
     "各区域的销售额是多少？",
     "每个月的销售额走势如何？",
+    "为什么 6 月的销售额比 5 月高？",
     "销售额最高的前 5 个商品是什么？",
     "哪个品类的客单价最高？",
     "哪个客户等级的销售额最高？",
@@ -133,6 +135,7 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "df": state.get("result"),
         "insight": state.get("insight") or "",
         "answer": state.get("answer") or "",
+        "attribution": state.get("attribution") or {},
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -178,14 +181,23 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
         # 空结果不画空图、不给空表，直接说明（洞察文案里已写清原因与建议）
         st.info("当前条件下没有匹配的数据行。")
     else:
+        att = msg.get("attribution") or {}
+        # 归因场景画"分项变化"最直观：原表是交叉表，画出来只是一堆折线
+        chart_source = attribution_chart_frame(att) if att.get("ok") else df
         if show_chart:
-            fig, chart_type = build_chart(df, question)
+            fig, chart_type = build_chart(chart_source, question)
             if fig is not None:
                 st.plotly_chart(fig, width="stretch")
                 st.caption(f"图表类型：{CHART_TYPE_LABEL.get(chart_type, chart_type)}")
 
-        st.dataframe(df, width="stretch",
-                     height=min(420, 42 + 35 * min(len(df), 10)))
+        if att.get("ok"):
+            st.caption(f"归因明细：「{att.get('current_label')}」对比"
+                       f"「{att.get('base_label')}」，按「{att.get('dim')}」拆解")
+            st.dataframe(att["table"], width="stretch",
+                         height=min(420, 42 + 35 * min(len(att["table"]), 10)))
+        else:
+            st.dataframe(df, width="stretch",
+                         height=min(420, 42 + 35 * min(len(df), 10)))
         st.download_button(
             "下载结果 CSV",
             data=df.to_csv(index=False).encode("utf-8-sig"),

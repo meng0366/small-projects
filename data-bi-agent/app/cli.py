@@ -64,9 +64,9 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 """与项目阶段对齐：阶段 6 是计划外增强（CLI 子命令、会话续聊、追问建议）；
-0.7 是改进清单 P1（修正回流 teach/lessons）。"""
+0.7 是改进清单 P1-1（修正回流 teach/lessons）；0.8 是 P1-2（指标归因）。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
                "teach", "t", "lessons", "ls", "version", "help")
@@ -265,6 +265,14 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
     else:
         print(render(df, "table"))
 
+    # 归因：把分项变化单独列出来 —— 结论里只放了最大的三项，
+    # 完整的加减表在这儿，方便逐项核对"总和到底对不对"。
+    att = state.get("attribution") or {}
+    if att.get("ok"):
+        print(f"\n[归因] 「{att.get('current_label')}」对比「{att.get('base_label')}」，"
+              f"按「{att.get('dim')}」拆解（指标：{att.get('metric')}）")
+        print(render(att["table"], "table"))
+
     chart_path = state.get("chart_path") or ""
     chart_type = state.get("chart_type") or "none"
     if chart_path:
@@ -283,6 +291,21 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
 def _build_payload(state: dict, question: str) -> dict:
     """`-f json` 的结构化输出：脚本里最需要的是语句、数据、指标，而不是排版。"""
     df = state.get("result")
+    att = state.get("attribution") or {}
+    attribution = None
+    if att.get("ok"):
+        attribution = {
+            "compare": {"base": att.get("base_label"), "current": att.get("current_label")},
+            "dimension": att.get("dim"),
+            "metric": att.get("metric"),
+            "base_total": att.get("base_total"),
+            "current_total": att.get("current_total"),
+            "delta": att.get("delta"),
+            "pct": att.get("pct"),
+            "additive": att.get("additive"),
+            "rows": json.loads(render(att["table"], "json")),
+            "notes": att.get("notes") or [],
+        }
     return {
         "question": question,
         "rewritten": state.get("rewritten_question") or "",
@@ -292,6 +315,7 @@ def _build_payload(state: dict, question: str) -> dict:
         "columns": [] if df is None else [str(c) for c in df.columns],
         "rows": 0 if df is None else int(len(df)),
         "data": [] if df is None else json.loads(render(df, "json")),
+        "attribution": attribution,
         "insight": state.get("insight") or "",
         "suggestions": state.get("suggestions") or [],
         "retries": int(state.get("retry_count") or 0),

@@ -16,14 +16,17 @@ from app.llm import get_llm, strip_code_fence
 from app.prompts.templates import (
     EMPTY_RESULT_FEEDBACK_TEMPLATE,
     ERROR_FEEDBACK_TEMPLATE,
+    FEW_SHOT_ATTRIBUTION,
     FEW_SHOT_EXAMPLES,
     FEW_SHOT_SQL,
     LESSON_PREAMBLE,
     SQL_USER_TEMPLATE,
     SYSTEM_ANALYST,
+    SYSTEM_ATTRIBUTION,
     SYSTEM_SQL,
     USER_TEMPLATE,
 )
+from app.tools.attribution import describe_comparison
 
 
 def _build_messages(system: str, examples: list, user_template: str,
@@ -85,6 +88,23 @@ def generate_sql(schema_info: str, terms: str, question: str,
     """根据问题 + 数据库 schema + 术语生成 SQL 语句（F2.3）。"""
     messages = _build_messages(SYSTEM_SQL, FEW_SHOT_SQL, SQL_USER_TEMPLATE,
                                schema_info, terms, question,
+                               previous_error, kind="SQL",
+                               previous_empty=previous_empty, lessons=lessons)
+    resp = get_llm().invoke(messages)
+    return strip_code_fence(resp.content)
+
+
+def generate_attribution_sql(schema_info: str, terms: str, question: str, intent: dict,
+                             previous_error: str = None, previous_empty: bool = False,
+                             lessons: list = None) -> str:
+    """归因专用：生成一条「对比列 × 拆解维度 × 指标」的交叉表 SQL（P1-2）。
+
+    与普通 SQL 生成的区别只在提示词：这里必须明确要求三列交叉表，
+    否则模型常常只返回"两期各一行"的总额，那种结果在代码侧拆不开
+    （`decompose` 会判 ok=False 并降级），用户就得不到归因。
+    """
+    messages = _build_messages(SYSTEM_ATTRIBUTION, FEW_SHOT_ATTRIBUTION, SQL_USER_TEMPLATE,
+                               schema_info, terms, question + describe_comparison(intent),
                                previous_error, kind="SQL",
                                previous_empty=previous_empty, lessons=lessons)
     resp = get_llm().invoke(messages)

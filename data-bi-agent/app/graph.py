@@ -26,7 +26,7 @@ from app.context import AgentContext
 from app.logging_utils import TokenCounter, log_run
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
-from app.nodes.generate import generate_code, generate_sql
+from app.nodes.generate import generate_attribution_sql, generate_code, generate_sql
 from app.nodes.reflect import (
     EMPTY_RESULT_NOTE,
     DEFAULT_MAX_RETRIES,
@@ -38,6 +38,7 @@ from app.nodes.reflect import (
 from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
+from app.tools.attribution import attribution_chart_frame, decompose
 from app.tools.enum_guard import build_clarify_answer
 from app.tools.lesson_store import select_lessons
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
@@ -70,8 +71,15 @@ def make_generate_node(ctx: AgentContext):
                 lessons = []      # 沉淀层出问题不能影响问答本身
         used = [item.get("id", "") for item in lessons]
 
+        intent = state.get("attribution_intent")
         try:
-            if route == "sql":
+            if intent and route == "sql":
+                # 归因问题要的不是"一个总数"，而是能拆的交叉表（P1-2）
+                statement = generate_attribution_sql(
+                    state.get("schema_info", ""), state.get("terms", ""), question, intent,
+                    previous_error=previous_error, previous_empty=previous_empty,
+                    lessons=lessons)
+            elif route == "sql":
                 statement = generate_sql(state.get("schema_info", ""), state.get("terms", ""),
                                          question, previous_error=previous_error,
                                          previous_empty=previous_empty, lessons=lessons)
@@ -221,6 +229,17 @@ def build_defer_answer(ctx: AgentContext, state: AgentState) -> str:
     return "\n".join(parts)
 
 
+def _chart_for(frame, question: str) -> dict:
+    """出图并落盘（图表是锦上添花，失败不该影响结论）。"""
+    try:
+        fig, chart_type = build_chart(frame, question)
+        return {"chart_type": chart_type,
+                "chart_path": save_chart(fig) if fig is not None else ""}
+    except Exception as e:
+        return {"chart_type": "none", "chart_path": "",
+                "error": f"图表生成失败：{type(e).__name__}: {e}"}
+
+
 def make_answer_node(ctx: AgentContext, with_chart: bool = True,
                      with_insight: bool = True):
     """回答节点：出图 + 生成洞察；彻底失败时给出可读的说明。"""
@@ -257,19 +276,28 @@ def make_answer_node(ctx: AgentContext, with_chart: bool = True,
         question = state.get("rewritten_question") or state.get("question", "")
         update = {}
 
+        # 归因（P1-2）：拆得开就直接给"变化来自哪里"，数字全由代码算。
+        # 拆不开不硬凑 —— 说明原因，退回普通明细，用户至少拿到的还是真实数据。
+        intent = state.get("attribution_intent")
+        note = ""
+        if intent:
+            att = decompose(result, intent, question)
+            update["attribution"] = att
+            if att.get("ok"):
+                update["insight"] = att["summary"]
+                update["answer"] = att["summary"]
+                if with_chart:
+                    update.update(_chart_for(attribution_chart_frame(att), question))
+                return update
+            note = (f"\n\n（没能拆出归因：{att.get('reason')}。上面是查询结果本身；"
+                    f"如果想按某个维度拆，可以在问题里说明，例如「按品类拆」。）")
+
         if with_chart:
-            try:
-                fig, chart_type = build_chart(result, question)
-                update["chart_type"] = chart_type
-                update["chart_path"] = save_chart(fig) if fig is not None else ""
-            except Exception as e:
-                update["chart_type"] = "none"
-                update["chart_path"] = ""
-                update["error"] = f"图表生成失败：{type(e).__name__}: {e}"
+            update.update(_chart_for(result, question))
 
         insight = generate_insight(question, result) if with_insight else local_insight(result)
-        update["insight"] = insight
-        update["answer"] = insight
+        update["insight"] = insight + note
+        update["answer"] = insight + note
         return update
 
     return node
@@ -377,6 +405,7 @@ class GraphAgent:
 
         result = state.get("result")
         unknown = state.get("unknown_enum")
+        att = state.get("attribution") or {}
 
         # 追问建议：纯规则计算（零 token），失败也不该影响本次回答
         try:
@@ -385,6 +414,16 @@ class GraphAgent:
                 state["suggestions"] = [
                     f"{v}的销售额是多少？"
                     for v in (unknown.get("values") or [])[:3]]
+            elif att.get("ok"):
+                # 归因场景：顺着"换个维度再拆"往下问，比通用建议更接得上。
+                # 要排除已经用过的拆解维度和对比列本身，否则会建议"再按区域拆"
+                # —— 而区域正是刚才的对比列。
+                used = {att.get("dim") or "", att.get("compare_col") or ""}
+                alt = next((d for d in ("区域", "品类", "客户等级") if d not in used), "区域")
+                state["suggestions"] = [
+                    f"同样的对比按「{alt}」拆解一下",
+                    f"「{att.get('current_label')}」的{att.get('metric')}走势如何？",
+                ]
             else:
                 state["suggestions"] = suggest_followups(
                     state.get("rewritten_question") or raw_question, result)
@@ -395,6 +434,7 @@ class GraphAgent:
             ok=result is not None or bool(unknown) or bool(state.get("defer")),
             clarify=bool(unknown),
             defer=bool(state.get("defer")),
+            attribution=bool((state.get("attribution") or {}).get("ok")),
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),

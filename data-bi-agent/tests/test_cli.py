@@ -338,6 +338,26 @@ class TestCliEndToEnd(unittest.TestCase):
         self.assertEqual(payload["suggestions"], ["各品类的销售额是多少？"])
         self.assertEqual(payload["data"][0]["区域"], "华南")
 
+    def test_attribution_outputs_table_and_json(self):
+        """归因结果要在两处露出来：人看的加减表，脚本看的 attribution 字段。"""
+        state = fake_state(sample_df())
+        state["attribution"] = {
+            "ok": True, "dim": "品类", "metric": "销售额",
+            "base_label": "5月", "current_label": "6月",
+            "base_total": 100.0, "current_total": 120.0, "delta": 20.0, "pct": 0.2,
+            "additive": True, "notes": [],
+            "table": pd.DataFrame({"维度": ["手机"], "基期": [100.0], "本期": [120.0],
+                                   "变化": [20.0], "贡献%": [100.0]}),
+        }
+        code, out, _ = self._run(["ask", "q"], state)
+        self.assertEqual(code, 0)
+        self.assertIn("[归因]", out)
+
+        code, out, _ = self._run(["ask", "q", "-f", "json"], state)
+        payload = json.loads(out)
+        self.assertEqual(payload["attribution"]["dimension"], "品类")
+        self.assertEqual(payload["attribution"]["rows"][0]["变化"], 20.0)
+
     def test_table_output_contains_sections(self):
         code, out, _ = self._run(["ask", "各区域的销售额是多少？"], fake_state(sample_df()))
         self.assertEqual(code, 0)

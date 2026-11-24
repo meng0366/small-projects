@@ -17,6 +17,7 @@ from app.context import AgentContext
 from app.llm import get_llm
 from app.prompts.templates import REWRITE_SYSTEM, REWRITE_USER_TEMPLATE
 from app.state import AgentState
+from app.tools.attribution import detect_attribution
 from app.tools.enum_guard import find_unknown_enum
 
 HISTORY_LIMIT = 6  # 最多带入 6 条历史（约 3 轮）
@@ -68,6 +69,12 @@ def make_understand_node(ctx: AgentContext):
         # 取值校验：拿**改写后**的问题去比对，多轮追问里的取值也能被拦住
         unknown = find_unknown_enum(rewritten, ctx.data_profile.get("enums") or [])
 
+        # 归因意图（P1-2）：纯规则识别，不额外调用模型。
+        # 只在 SQL 路线启用：归因需要一条"对比列 × 维度 × 指标"的交叉表，
+        # 对应的提示词是 SQL 版；单表 pandas 路线没有等价模板，
+        # 硬做只会拆出一张对不上的表，不如老实用普通问答。
+        intent = detect_attribution(rewritten, ctx.enums) if route == "sql" else None
+
         return {
             "rewritten_question": rewritten,
             "route": route,
@@ -75,6 +82,7 @@ def make_understand_node(ctx: AgentContext):
             "terms": ctx.terms,
             "retry_count": state.get("retry_count", 0),
             "unknown_enum": unknown,
+            "attribution_intent": intent,
         }
 
     return node

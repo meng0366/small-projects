@@ -66,8 +66,29 @@ class TestWebUI(unittest.TestCase):
         self.assertEqual(len(at.exception), 0)
         self.assertIn("数据分析 Agent", at.title[0].value)
         self.assertEqual(len(at.chat_input), 1)
-        # 侧边栏：6 个示例问题 + 清空对话
-        self.assertEqual(len(at.sidebar.button), 7)
+        # 侧边栏：7 个示例问题 + 清空对话
+        self.assertEqual(len(at.sidebar.button), 8)
+
+    def test_attribution_renders_detail_table(self):
+        """归因场景展示的是"分项变化"表，而不是原始交叉表。"""
+        at = self._app()
+        state = dict(FAKE_STATE, attribution={
+            "ok": True, "dim": "品类", "metric": "销售额",
+            "base_label": "5月", "current_label": "6月",
+            "additive": True,
+            "table": pd.DataFrame({"维度": ["笔记本", "配件"],
+                                   "基期": [674130.75, 31522.00],
+                                   "本期": [889779.30, 47014.15],
+                                   "变化": [215648.55, 15492.15],
+                                   "贡献%": [48.4, 3.5]}),
+        })
+        with mock.patch("app.graph.GraphAgent.run", return_value=state):
+            at.chat_input[0].set_value("为什么 6 月的销售额比 5 月高？").run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual(len(at.dataframe), 1)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("归因明细", captions)
 
     def test_ask_renders_insight_table_chart(self):
         at = self._app()

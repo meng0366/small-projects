@@ -26,6 +26,7 @@ class AgentState(TypedDict, total=False):
     terms: str                       # 业务术语口径
     route: str                       # "sql" | "pandas"
     unknown_enum: Any                # 用户提到的枚举值库里没有时，记录澄清信息（P0-1b）
+    attribution_intent: Any          # 归因意图：谁跟谁比（P1-2），None 表示普通问答
 
     # ---- 生成与执行 ----
     statement: str                   # 生成的 SQL 或 Python 代码
@@ -45,6 +46,7 @@ class AgentState(TypedDict, total=False):
 
     # ---- 输出 ----
     insight: str                     # 洞察文案
+    attribution: Any                 # 归因结果（含分项表与结论，P1-2）
     chart_path: str                  # 图表 HTML 路径
     chart_type: str                  # 图表类型标识
     answer: str                      # 最终回答（失败时的说明文本）

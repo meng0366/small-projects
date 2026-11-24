@@ -115,6 +115,57 @@ SQL_USER_TEMPLATE = """{schema}
 请只输出一条 SQL 语句。"""
 
 
+# ============ 阶段 7：指标归因（P1-2） ============
+
+# 归因不是"再查一个总数"，而是要一张**能拆的交叉表**：
+# 对比列（月份/区域）× 拆解维度（品类/客户等级）× 指标。
+# 拆解与占比由代码计算（app/tools/attribution.py），模型只需保证表结构可用 ——
+# 让模型自己算占比，会出现三项占比加不到 100% 这种没人能看出来的错。
+SYSTEM_ATTRIBUTION = """你是一名资深数据分析师，正在做**指标归因**：
+用户想知道"某个指标为什么变了"，你要给出能让系统拆解的查询结果。
+
+请输出一条 SQL，返回一张**交叉表**，硬性规则：
+1. 只输出一条 SELECT 语句，不要解释文字，不要 markdown 代码块；
+2. 结果必须是三列，且都用中文别名：
+   ① 对比列（月份或区域，如 AS 月份）
+   ② 拆解维度（业务分类字段，如 AS 品类）
+   ③ 指标（按业务术语口径计算，如 AS 销售额）
+3. WHERE 里只保留用户指定的**那两个对比对象**，不要扩大到其他月份或区域；
+4. 必须 GROUP BY 对比列与拆解维度，**不要返回合计行**（不要 UNION 合计，不要 ROLLUP）；
+5. 拆解维度要选业务上最能解释差异的分类字段（品类 / 区域 / 客户等级），
+   不要用订单号、客户名这类几乎每条都不同的字段（那等于没拆）；
+6. 日期字段 order_date 是 'YYYY-MM-DD' 文本：按月份筛选用
+   strftime('%Y-%m', o.order_date) IN ('2025-05','2025-06')，不要写 LIKE '%5月%'；
+7. 金额用 ROUND(SUM(...), 2)；口径严格按业务术语，不要自行定义；
+8. 若缺少必要字段，只输出一行：DEFER: <缺少什么字段>。
+"""
+
+FEW_SHOT_ATTRIBUTION = [
+    (
+        "为什么 2025 年 6 月的销售额比 5 月高？",
+        "SELECT strftime('%Y-%m', o.order_date) AS 月份,\n"
+        "       p.category AS 品类,\n"
+        "       ROUND(SUM(o.amount), 2) AS 销售额\n"
+        "FROM orders o\n"
+        "JOIN products p ON o.product_id = p.product_id\n"
+        "WHERE strftime('%Y-%m', o.order_date) IN ('2025-05', '2025-06')\n"
+        "GROUP BY 月份, 品类\n"
+        "ORDER BY 月份",
+    ),
+    (
+        "为什么华东的销售额比华北高？",
+        "SELECT c.region AS 区域,\n"
+        "       p.category AS 品类,\n"
+        "       ROUND(SUM(o.amount), 2) AS 销售额\n"
+        "FROM orders o\n"
+        "JOIN customers c ON o.customer_id = c.customer_id\n"
+        "JOIN products p ON o.product_id = p.product_id\n"
+        "WHERE c.region IN ('华东', '华北')\n"
+        "GROUP BY c.region, p.category",
+    ),
+]
+
+
 # ============ 阶段 2：洞察文案 ============
 
 INSIGHT_SYSTEM = """你是一名资深数据分析师。你会拿到一个业务问题和查询结果摘要。
