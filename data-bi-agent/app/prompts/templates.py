@@ -137,6 +137,9 @@ SYSTEM_ATTRIBUTION = """你是一名资深数据分析师，正在做**指标归
    不要用订单号、客户名这类几乎每条都不同的字段（那等于没拆）；
 6. 日期字段 order_date 是 'YYYY-MM-DD' 文本：按月份筛选用
    strftime('%Y-%m', o.order_date) IN ('2025-05','2025-06')，不要写 LIKE '%5月%'；
+   **季度/半年是跨度**（Q2 = 4~6 月、上半年 = 1~6 月）：要展开成月份来筛，
+   如 Q1 与 Q2 写成 IN ('2025-01','2025-02','2025-03','2025-04','2025-05','2025-06')，
+   不要把 Q2 当成某一个月（如只写 '2025-06'）；
 7. 金额用 ROUND(SUM(...), 2)；口径严格按业务术语，不要自行定义；
 8. 若缺少必要字段，只输出一行：DEFER: <缺少什么字段>。
 """
@@ -163,6 +166,19 @@ FEW_SHOT_ATTRIBUTION = [
         "JOIN products p ON o.product_id = p.product_id\n"
         "WHERE c.region IN ('华东', '华北')\n"
         "GROUP BY c.region, p.category",
+    ),
+    # 季度示例：跨度要展开成月份，否则模型容易只筛 Q2 的最后一个月
+    (
+        "为什么 2025 年 Q2 的销售额比 Q1 高？",
+        "SELECT strftime('%Y-%m', o.order_date) AS 月份,\n"
+        "       p.category AS 品类,\n"
+        "       ROUND(SUM(o.amount), 2) AS 销售额\n"
+        "FROM orders o\n"
+        "JOIN products p ON o.product_id = p.product_id\n"
+        "WHERE strftime('%Y-%m', o.order_date) IN\n"
+        "      ('2025-01','2025-02','2025-03','2025-04','2025-05','2025-06')\n"
+        "GROUP BY 月份, 品类\n"
+        "ORDER BY 月份",
     ),
     # 四列示例：用户点了两个维度，就要一次把两层都查出来（代码侧做二级下钻）
     (

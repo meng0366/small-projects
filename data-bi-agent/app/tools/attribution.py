@@ -61,6 +61,19 @@ CN_PERIOD_RE = re.compile(
 )
 YEAR_ONLY_RE = re.compile(r"(?<![\d年])(\d{4})\s*年(?!\s*[\d一二三四五六七八九十])")
 
+# 季度：「Q2」「2025Q2」「2025-Q2」「第二季度」「第 2 季度」
+QUARTER_RE = re.compile(
+    r"(?:(?P<y>\d{4})\s*(?:年|[-/])?\s*)?"
+    r"(?:第\s*(?P<q1>[1-4一二三四])\s*季度|Q\s*(?P<q2>[1-4])(?![\d]))",
+    re.IGNORECASE,
+)
+# 半年：「上半年」「2025 年下半年」「H1」「H2」
+HALF_RE = re.compile(
+    r"(?:(?P<y>\d{4})\s*(?:年|[-/])?\s*(?:的)?\s*)?"
+    r"(?:(?P<h1>[上下前后])半年|H(?P<h2>[12])(?![\d]))",
+    re.IGNORECASE,
+)
+
 CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
@@ -82,63 +95,136 @@ def cn_to_int(text: str) -> Optional[int]:
 
 
 def period_key(text) -> Optional[tuple]:
-    """把各种时段写法归一成 (年, 月)，缺失的部分为 None。
+    """把各种时段写法归一成 (年, 起始月, 结束月)，缺失的部分为 None。
 
-    '2025-06' / '2025/6' / '2025年6月' / '六月' / '202506' / '2025年' 都能识别。
-    归一化的目的：让用户口径（'6月'）与库里口径（'2025-06'）能对上，
-    而不是要求用户按数据库格式提问。
+    '2025-06' / '2025/6' / '2025年6月' / '六月' / '202506' / '2025年' 都能识别；
+    季度与半年是**跨度**而不是某个单月：'Q2' → (年, 4, 6)、'上半年' → (年, 1, 6)。
+    归一化的目的：让用户口径（'Q2'）与库里口径（'2025-04'~'2025-06' 的月份行，
+    或计算出来的 '2025Q2'）能对上，而不是要求用户按数据库格式提问。
     """
     s = str(text).strip()
     if not s:
         return None
 
+    # 季度 / 半年先判：'2025Q2' 若先按年月解析会被切错
+    m = QUARTER_RE.fullmatch(s)
+    if m:
+        raw = m.group("q1") or m.group("q2")
+        quarter = int(raw) if str(raw).isdigit() else cn_to_int(raw)
+        if quarter and 1 <= quarter <= 4:
+            year = int(m.group("y")) if m.group("y") else None
+            return year, quarter * 3 - 2, quarter * 3
+    m = HALF_RE.fullmatch(s)
+    if m:
+        year = int(m.group("y")) if m.group("y") else None
+        half = m.group("h1") or m.group("h2")
+        first = str(half) in ("上", "前", "1")
+        return (year, 1, 6) if first else (year, 7, 12)
+
     m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})(?:[-/.]\d{1,2})?", s)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        return int(m.group(1)), int(m.group(2)), int(m.group(2))
     m = re.fullmatch(r"(\d{4})\s*年\s*(\d{1,2})\s*月?", s)
     if m:
-        return int(m.group(1)), int(m.group(2))
+        return int(m.group(1)), int(m.group(2)), int(m.group(2))
     m = re.fullmatch(r"(\d{4})(\d{2})", s)          # 202506
     if m and 1 <= int(m.group(2)) <= 12:
-        return int(m.group(1)), int(m.group(2))
+        return int(m.group(1)), int(m.group(2)), int(m.group(2))
     m = re.fullmatch(r"(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*月", s)
     if m:
         month = cn_to_int(m.group(1))
         if month and 1 <= month <= 12:
-            return None, month
+            return None, month, month
     m = re.fullmatch(r"(\d{4})\s*年", s)
     if m:
-        return int(m.group(1)), None
+        return int(m.group(1)), None, None
     return None
 
 
+def _span_len(key: tuple) -> int:
+    """跨度里有几个月；只问到年份时返回 0。"""
+    start, end = (key or (None, None, None))[1:]
+    if start is None or end is None:
+        return 0
+    return max(0, end - start + 1)
+
+
+def _quarter_of(key: tuple) -> Optional[int]:
+    """整三个月且对齐季度的跨度 → 季度序号；否则 None。"""
+    start, end = (key or (None, None, None))[1:]
+    if start is None or end is None or end - start != 2 or (start - 1) % 3:
+        return None
+    return (start - 1) // 3 + 1
+
+
+def _period_label(key: tuple) -> str:
+    """把 (年, 起, 止) 写成一句人话，用于「默认与上一期比较」这类说明。"""
+    year, start, end = key
+    head = f"{year}年" if year else ""
+    quarter = _quarter_of(key)
+    if quarter:
+        return f"{head}Q{quarter}"
+    if (start, end) == (1, 6):
+        return f"{head}上半年"
+    if (start, end) == (7, 12):
+        return f"{head}下半年"
+    if start is None:
+        return f"{year}年"
+    if start == end:
+        return f"{head}{start}月"
+    return f"{head}{start}-{end}月"
+
+
 def _compatible(a: tuple, b: tuple) -> bool:
-    """两个 (年, 月) 是否指同一时段；只问到月份时忽略年份。"""
-    y1, m1 = a
-    y2, m2 = b
-    if m1 is not None and m2 is not None and m1 != m2:
-        return False
+    """两个时段是否有交集；只问到年份时忽略月份。
+
+    改成"有交集"而不是"月份相同"，是为了让跨度也能对上：
+    用户说 'Q1'、数据里是 '2025-01' 这样的月份行时，两者指同一段时间。
+    """
+    y1, s1, e1 = a
+    y2, s2, e2 = b
     if y1 is not None and y2 is not None and y1 != y2:
         return False
-    return True
+    if s1 is None or s2 is None:      # 只到年：该年内的月份都算
+        return True
+    return not (e1 < s2 or e2 < s1)
 
 
 def _find_periods(text: str) -> list:
-    """找出问题里出现的时段，按出现位置排序（重叠的取更长的那段）。"""
+    """找出问题里出现的时段，按出现位置排序（重叠的取更长的那段）。
+
+    季度/半年也在这里识别：'Q2 比 Q1' 里的两个 Q 各是一段跨度。
+    重叠处理很关键 —— '2025年Q2' 会同时命中「2025年」和「Q2」，
+    保留更长的那一条，否则一个时段会被算成两个。
+    """
     hits = []
     for m in ISO_PERIOD_RE.finditer(text):
         hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0),
-                     "key": (int(m.group(1)), int(m.group(2)))})
+                     "key": (int(m.group(1)), int(m.group(2)), int(m.group(2)))})
     for m in CN_PERIOD_RE.finditer(text):
         month = cn_to_int(m.group("m"))
         if not month or not 1 <= month <= 12:
             continue
         year = int(m.group("y")) if m.group("y") else None
         hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0).strip(),
-                     "key": (year, month)})
+                     "key": (year, month, month)})
+    for m in QUARTER_RE.finditer(text):
+        raw = m.group("q1") or m.group("q2")
+        quarter = int(raw) if str(raw).isdigit() else cn_to_int(raw)
+        if not quarter or not 1 <= quarter <= 4:
+            continue
+        year = int(m.group("y")) if m.group("y") else None
+        hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0).strip(),
+                     "key": (year, quarter * 3 - 2, quarter * 3)})
+    for m in HALF_RE.finditer(text):
+        half = m.group("h1") or m.group("h2")
+        first = str(half) in ("上", "前", "1")
+        year = int(m.group("y")) if m.group("y") else None
+        hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0).strip(),
+                     "key": (year, 1, 6) if first else (year, 7, 12)})
     for m in YEAR_ONLY_RE.finditer(text):
         hits.append({"start": m.start(), "end": m.end(), "raw": m.group(0),
-                     "key": (int(m.group(1)), None)})
+                     "key": (int(m.group(1)), None, None)})
 
     hits.sort(key=lambda h: (h["start"], -(h["end"] - h["start"])))
     picked, cursor = [], -1
@@ -172,13 +258,24 @@ def _dimension_hints(question: str) -> list:
 
 
 def _previous_period(key: tuple) -> Optional[tuple]:
-    """上一期（月粒度）；月份缺失时无法推，返回 None。"""
-    year, month = key
-    if month is None:
+    """紧挨着这一段的前一段：月 → 上月；Q2 → Q1；上半年 → 去年下半年。
+
+    按"长度相同、紧邻在前"来推，而不是只对月份减 1 —— 否则「Q2 为什么下降」
+    会被拿去和 6 月的上一月（5 月）比，比出来的是个月环比，答的不是用户问的季度。
+    """
+    year, start, end = key
+    if start is None:
         return None
-    if month == 1:
-        return (year - 1 if year else None), 12
-    return year, month - 1
+    length = max(1, (end or start) - start + 1)
+    prev_end = start - 1
+    prev_year = year
+    if prev_end < 1:
+        prev_end += 12
+        prev_year = (year - 1) if year else None
+    prev_start = prev_end - length + 1
+    if prev_start < 1:           # 只有跨度 ≥ 12 个月才会走到这里，稳妥处理
+        prev_start += 12
+    return prev_year, prev_start, prev_end
 
 
 # ---------------------------------------------------------------- 意图识别
@@ -223,7 +320,7 @@ def detect_attribution(question: str, enums: list = None) -> Optional[dict]:
         if prev:
             return {
                 "kind": "period",
-                "base": f"{prev[0]}年{prev[1]}月" if prev[0] else f"{prev[1]}月",
+                "base": _period_label(prev),
                 "current": current["raw"],
                 "base_key": prev, "current_key": current["key"],
                 "assumed": True,
@@ -293,7 +390,7 @@ def _limit_year(frame: pd.DataFrame, col, mask: pd.Series, label: str):
         return mask, ""
     latest = years[-1]
     keep = mask & frame[col].map(
-        lambda v: (period_key(v) or (None, None))[0] == latest)
+        lambda v: (period_key(v) or (None, None, None))[0] == latest)
     return keep, f"问题里没写年份，已按数据中最新的 {latest} 年计算"
 
 
@@ -395,12 +492,43 @@ def _is_ratio_metric(metric: str) -> bool:
     return any(h in name for h in RATIO_HINTS)
 
 
-def _month_days(key: tuple) -> Optional[int]:
-    """该月有多少天；没写年份时按平年（2025）算，避免闰年 2 月把提示吃掉。"""
-    year, month = key or (None, None)
-    if month is None:
+def _period_days(key: tuple) -> Optional[int]:
+    """这一段自然有多少天；没写年份时按平年（2025）算，避免闰年 2 月把提示吃掉。
+
+    跨度按各月天数累加：季度 90/91/92 天、半年 181/184 天，差 2% 左右，
+    不会触发"天数不同"的提醒（阈值 8%），但月对月（2 月 vs 3 月）仍会提醒。
+    """
+    year, start, end = key or (None, None, None)
+    if start is None or end is None:
         return None
-    return calendar.monthrange(year or 2025, month)[1]
+    year = year or 2025
+    return sum(calendar.monthrange(year, month)[1] for month in range(start, end + 1))
+
+
+def _missing_compare_hint(frame: pd.DataFrame, intent: dict) -> str:
+    """拆不了时给一句能定位的话：到底是"没有这段数据"还是"结果里没这一期"。
+
+    「为什么 2025 年 Q1 下降了」默认与 2024Q4 比，但库里常常没有 2024 年 ——
+    这时候说"找不到对比列"会让人以为是自己问错了，其实是基期没数据。
+    """
+    base, current = str(intent.get("base", "")), str(intent.get("current", ""))
+
+    def present(label: str) -> str:
+        for col in frame.columns:
+            if _is_numeric(frame[col]):
+                continue
+            values = frame[col].dropna()
+            if not values.empty and values.map(lambda v: _value_matches(v, label)).any():
+                return str(col)
+        return ""
+
+    has_base, has_current = present(base), present(current)
+    if has_current and not has_base:
+        return (f"结果里只有「{current}」，没有「{base}」——这一段可能库里就没有数据，"
+                f"没有可比对象，不做归因")
+    if has_base and not has_current:
+        return f"结果里只有「{base}」，没有「{current}」——缺本期数据，不做归因"
+    return f"结果里找不到与「{base}」「{current}」对应的对比列"
 
 
 def decompose(frame, intent: dict, question: str = "") -> dict:
@@ -416,9 +544,7 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
 
     comp_col, side, year_note = _find_compare_column(frame, intent)
     if not comp_col:
-        return {"ok": False,
-                "reason": f"结果里找不到与「{intent.get('base')}」「{intent.get('current')}」"
-                          f"对应的对比列"}
+        return {"ok": False, "reason": _missing_compare_hint(frame, intent)}
 
     metric = _pick_metric(frame, question, exclude={comp_col})
     if not metric:
@@ -510,8 +636,8 @@ def decompose(frame, intent: dict, question: str = "") -> dict:
         notes.append(f"「{'、'.join(missing_current[:3])}」只在「{intent.get('base')}」有数据，"
                      f"按消失处理（本期记 0）")
     if intent.get("kind") == "period" and not intent.get("assumed"):
-        days_base = _month_days(intent.get("base_key"))
-        days_current = _month_days(intent.get("current_key"))
+        days_base = _period_days(intent.get("base_key"))
+        days_current = _period_days(intent.get("current_key"))
         # 31 天和 30 天差 3%，算不上偏差，只会添噪；超过 8% 才值得提醒（如 2 月对 3 月）
         if days_base and days_current and abs(days_base - days_current) / max(days_base, days_current) >= 0.08:
             notes.append(f"两期自然天数不同（{days_base} 天 / {days_current} 天），"
@@ -657,6 +783,28 @@ def format_attribution(att: dict) -> str:
     return "\n".join(lines)
 
 
+def _span_hint(intent: dict) -> str:
+    """季度/半年是跨度，提示模型把每个时段展开成月份 —— 只说"Q1"它可能只筛一个月。"""
+    keys = [intent.get("base_key"), intent.get("current_key")]
+    spans = [k for k in keys if k and _span_len(k) > 1]
+    if not spans:
+        return ""
+    sample = next((k for k in spans if k[0]), spans[0])   # 有年份的那段更适合当示例
+    months = list(range(sample[1], sample[2] + 1))
+    quarter = _quarter_of(sample)
+    if quarter:
+        tail = (f"对比列用月份（每段多行）或直接用季度（如 '{sample[0]}Q{quarter}'）都可以。"
+                if sample[0] else "对比列用月份（每段多行）或直接用季度都可以。")
+    else:
+        tail = "对比列用月份（每段多行）或直接用半年标签都可以。"
+    if sample[0]:
+        sample_sql = "、".join(f"'{sample[0]}-{m:02d}'" for m in months)
+        return (f"注意：问题里的时段是**跨度**（季度/半年），不是单月。SQL 要把每个时段"
+                f"展开成对应月份来筛，例如 {sample_sql}；{tail}")
+    return (f"注意：问题里的时段是**跨度**（季度/半年），不是单月。SQL 要把每个时段展开成"
+            f"对应月份来筛（如 {months[0]:02d}~{months[-1]:02d} 这 {len(months)} 个月），{tail}")
+
+
 def describe_comparison(intent: dict) -> str:
     """把意图写成一句给模型看的说明：谁跟谁比、按什么拆。
 
@@ -676,8 +824,10 @@ def describe_comparison(intent: dict) -> str:
     else:
         dim = dims[0] if dims else "最能解释差异的业务分类字段"
         shape = f"「{compare} × {dim} × 指标」三列交叉表"
+    span = _span_hint(intent)
     return (f"\n\n【归因要求】以「{base}」为参照、「{current}」为被解释对象；"
-            f"结果需要{shape}，不要只给两行总数。")
+            f"结果需要{shape}，不要只给两行总数。"
+            + (f"\n{span}" if span else ""))
 
 
 def attribution_chart_frame(att: dict) -> Optional[pd.DataFrame]:

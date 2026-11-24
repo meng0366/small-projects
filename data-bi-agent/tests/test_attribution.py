@@ -48,12 +48,33 @@ def crosstab_two_dims() -> pd.DataFrame:
 class TestPeriodKey(unittest.TestCase):
     def test_variants(self):
         cases = {
-            "2025-06": (2025, 6), "2025/6": (2025, 6), "2025年6月": (2025, 6),
-            "六月": (None, 6), "6月": (None, 6), "202506": (2025, 6),
-            "2025年": (2025, None), "手机": None, "": None,
+            "2025-06": (2025, 6, 6), "2025/6": (2025, 6, 6), "2025年6月": (2025, 6, 6),
+            "六月": (None, 6, 6), "6月": (None, 6, 6), "202506": (2025, 6, 6),
+            "2025年": (2025, None, None), "手机": None, "": None,
         }
         for text, expected in cases.items():
             self.assertEqual(period_key(text), expected, text)
+
+    def test_quarter_and_half_spans(self):
+        """季度/半年是跨度，不是某个月：归一成 (年, 起, 止)。"""
+        cases = {
+            "Q2": (None, 4, 6), "q2": (None, 4, 6), "2025Q2": (2025, 4, 6),
+            "2025-Q1": (2025, 1, 3), "第二季度": (None, 4, 6), "第 3 季度": (None, 7, 9),
+            "2025年第四季度": (2025, 10, 12),
+            "上半年": (None, 1, 6), "下半年": (None, 7, 12), "H1": (None, 1, 6),
+            "2025年下半年": (2025, 7, 12), "2025年H2": (2025, 7, 12),
+        }
+        for text, expected in cases.items():
+            self.assertEqual(period_key(text), expected, text)
+
+    def test_quarter_month_pair_matches_by_overlap(self):
+        """用户说 "Q1"、数据里是月份行：两者指同一段时间，要能对上。"""
+        from app.tools.attribution import _compatible
+
+        self.assertTrue(_compatible(period_key("Q1"), period_key("2025-02")))
+        self.assertTrue(_compatible(period_key("Q1"), period_key("2025-03")))
+        self.assertFalse(_compatible(period_key("Q1"), period_key("2025-04")))
+        self.assertFalse(_compatible(period_key("2025Q2"), period_key("2024-05")))
 
 
 class TestIntentDetection(unittest.TestCase):
@@ -74,11 +95,11 @@ class TestIntentDetection(unittest.TestCase):
         intent = detect_attribution("6 月的销售额为什么下降了？", ENUMS)
         self.assertTrue(intent["assumed"])
         self.assertEqual(intent["base"], "5月")
-        self.assertEqual(intent["base_key"], (None, 5))
+        self.assertEqual(intent["base_key"], (None, 5, 5))
 
     def test_january_wraps_to_previous_december(self):
         intent = detect_attribution("为什么 2025 年 1 月销售额下降了？", ENUMS)
-        self.assertEqual(intent["base_key"], (2024, 12))
+        self.assertEqual(intent["base_key"], (2024, 12, 12))
 
     def test_dimension_pair(self):
         intent = detect_attribution("为什么华东的销售额比华北高？", ENUMS)
@@ -93,6 +114,126 @@ class TestIntentDetection(unittest.TestCase):
 
     def test_cause_word_without_comparison_is_not_attribution(self):
         self.assertIsNone(detect_attribution("为什么销售额这么高？", ENUMS))
+
+
+class TestQuarterIntent(unittest.TestCase):
+    """季度/半年：既是"两个时段"，也是"跨度"。"""
+
+    def test_quarter_pair_than_order(self):
+        """「Q2 比 Q1 高」→ 解释 Q2，参照 Q1。"""
+        intent = detect_attribution("为什么 Q2 的销售额比 Q1 高？", ENUMS)
+        self.assertEqual(intent["kind"], "period")
+        self.assertEqual((intent["base"], intent["current"]), ("Q1", "Q2"))
+        self.assertEqual(intent["base_key"], (None, 1, 3))
+        self.assertEqual(intent["current_key"], (None, 4, 6))
+
+    def test_quarter_pair_from_to_order(self):
+        intent = detect_attribution("从 Q1 到 Q2 销售额为什么上升了？", ENUMS)
+        self.assertEqual((intent["base"], intent["current"]), ("Q1", "Q2"))
+
+    def test_quarter_with_year_is_one_period_not_two(self):
+        """「2025年Q2」不能被拆成「2025年」+「Q2」两个时段。"""
+        intent = detect_attribution("为什么 2025 年 Q2 的销售额比 Q1 高？", ENUMS)
+        self.assertEqual(intent["current_key"], (2025, 4, 6))
+        self.assertEqual(intent["base_key"], (None, 1, 3))
+
+    def test_chinese_quarter_and_half(self):
+        intent = detect_attribution("为什么第二季度的销售额比第一季度高？", ENUMS)
+        self.assertEqual((intent["base_key"], intent["current_key"]),
+                         ((None, 1, 3), (None, 4, 6)))
+        half = detect_attribution("为什么下半年的销售额比上半年低？", ENUMS)
+        self.assertEqual((half["base_key"], half["current_key"]),
+                         ((None, 1, 6), (None, 7, 12)))
+
+    def test_single_quarter_defaults_to_previous_quarter(self):
+        """只说一个季度时，要比的是上一季度，不是上一个月。"""
+        intent = detect_attribution("为什么 2025 年 Q1 的销售额下降了？", ENUMS)
+        self.assertTrue(intent["assumed"])
+        self.assertEqual(intent["base_key"], (2024, 10, 12))
+        self.assertEqual(intent["base"], "2024年Q4")
+
+    def test_quarter_without_cause_word_is_not_attribution(self):
+        self.assertIsNone(detect_attribution("Q2 的销售额是多少？", ENUMS))
+
+    def test_compare_prompt_asks_to_expand_months(self):
+        """提示词要说明"跨度要展开成月份"，否则模型可能只筛一个月。"""
+        from app.tools.attribution import describe_comparison
+
+        intent = detect_attribution("为什么 2025 年 Q2 的销售额比 Q1 高？", ENUMS)
+        prompt = describe_comparison(intent)
+        self.assertIn("跨度", prompt)
+        self.assertIn("'2025-04'", prompt)     # Q2 的三行月份，提醒按月展开
+
+    def test_month_question_gets_no_span_prompt(self):
+        from app.tools.attribution import describe_comparison
+
+        intent = detect_attribution("为什么 2025 年 6 月的销售额比 5 月高？", ENUMS)
+        self.assertNotIn("跨度", describe_comparison(intent))
+
+
+def quarter_crosstab() -> pd.DataFrame:
+    """「月份 × 品类」交叉表，覆盖 2025 Q1（100）与 Q2（120）：
+
+    Q1 → 手机 30 / 笔记本 70；Q2 → 手机 40 / 笔记本 80。差额 20 由两个品类各担 10。
+    """
+    rows = [
+        ("2025-01", "手机", 10.0), ("2025-02", "手机", 20.0),
+        ("2025-01", "笔记本", 40.0), ("2025-03", "笔记本", 30.0),
+        ("2025-04", "手机", 15.0), ("2025-05", "手机", 25.0),
+        ("2025-04", "笔记本", 45.0), ("2025-06", "笔记本", 35.0),
+    ]
+    return pd.DataFrame(rows, columns=["月份", "品类", "销售额"])
+
+
+class TestQuarterDecompose(unittest.TestCase):
+    """季度对比的拆解：对比列可能已被展开成月份，也可能直接是季度。"""
+
+    def setUp(self):
+        self.intent = detect_attribution("为什么 Q2 的销售额比 Q1 高？", ENUMS)
+
+    def test_month_rows_are_rolled_into_quarters(self):
+        att = decompose(quarter_crosstab(), self.intent)
+        self.assertTrue(att["ok"])
+        self.assertEqual(att["base_total"], 100.0)
+        self.assertEqual(att["current_total"], 120.0)
+        self.assertEqual(att["delta"], 20.0)
+        self.assertEqual(att["table"].set_index("维度").loc["手机", "变化"], 10.0)
+        self.assertEqual(att["table"].set_index("维度").loc["笔记本", "变化"], 10.0)
+
+    def test_rows_outside_both_quarters_are_ignored(self):
+        """7 月（Q3）的行不能被算进 Q2 —— 不然"Q2 比 Q1"会算成三个季度。"""
+        frame = pd.concat([quarter_crosstab(), pd.DataFrame(
+            {"月份": ["2025-07"], "品类": ["手机"], "销售额": [999.0]})], ignore_index=True)
+        att = decompose(frame, self.intent)
+        self.assertEqual(att["current_total"], 120.0)
+
+    def test_quarter_column_also_works(self):
+        """模型直接按季度出列（2025Q1 / 2025Q2）也要能拆。"""
+        frame = pd.DataFrame({
+            "季度": ["2025Q1", "2025Q1", "2025Q2", "2025Q2"],
+            "品类": ["手机", "笔记本", "手机", "笔记本"],
+            "销售额": [30.0, 70.0, 40.0, 80.0],
+        })
+        att = decompose(frame, self.intent)
+        self.assertTrue(att["ok"])
+        self.assertEqual(att["compare_col"], "季度")
+        self.assertEqual((att["base_total"], att["current_total"]), (100.0, 120.0))
+        self.assertIn("Q2", att["summary"])
+
+    def test_quarter_span_has_no_day_count_note(self):
+        """同季度对比自然天数接近，不该刷"天数不同"的提醒。"""
+        att = decompose(quarter_crosstab(), self.intent)
+        self.assertFalse(any("天数" in n for n in att["notes"]), att["notes"])
+
+    def test_missing_base_quarter_says_which_side_is_missing(self):
+        """只给 Q1 的数据、却比的是 2024Q4：要说明缺的是基期，而不是"找不到对比列"。"""
+        frame = quarter_crosstab()
+        frame = frame[frame["月份"].str.startswith(("2025-01", "2025-02", "2025-03"))]
+        intent = detect_attribution("为什么 2025 年 Q1 的销售额下降了？", ENUMS)
+        att = decompose(frame, intent)
+        self.assertFalse(att["ok"])
+        self.assertIn("2024年Q4", att["reason"])
+        self.assertIn("没有可比对象", att["reason"])
 
 
 class TestDecompose(unittest.TestCase):
