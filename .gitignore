@@ -24,6 +24,9 @@ data/private/
 *.sqlite3
 *.log
 
+# 图表输出
+output/
+
 # ============ IDE ============
 .vscode/
 .idea/

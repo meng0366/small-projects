@@ -2,6 +2,8 @@
 
 运行：python -m unittest discover -s tests -v
 """
+import os
+import tempfile
 import unittest
 
 import pandas as pd
@@ -14,6 +16,7 @@ from app.schema.loader import (
     list_tables,
     build_db_schema_text,
 )
+from app.tools.chart_tool import build_chart, detect_chart_type, save_chart
 from app.tools.sql_tool import run_sql
 
 
@@ -145,6 +148,40 @@ class TestSqlTool(unittest.TestCase):
         r = run_sql("SELECT not_a_column FROM orders", self.db_path)
         self.assertFalse(r["ok"])
         self.assertEqual(r["stage"], "runtime")
+
+
+class TestChart(unittest.TestCase):
+    """自动选图规则（F2.5）。"""
+
+    def test_time_series_picks_line(self):
+        df = pd.DataFrame({"月份": ["2025-01", "2025-02"], "销售额": [1.0, 2.0]})
+        self.assertEqual(detect_chart_type(df), "line")
+
+    def test_category_picks_bar(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        self.assertEqual(detect_chart_type(df), "bar")
+
+    def test_share_picks_pie(self):
+        df = pd.DataFrame({"品类": ["手机", "平板"], "销售占比": [60.0, 40.0]})
+        self.assertEqual(detect_chart_type(df), "pie")
+
+    def test_single_value_no_chart(self):
+        df = pd.DataFrame({"总销售额": [123.0]})
+        self.assertEqual(detect_chart_type(df), "none")
+
+    def test_build_chart_returns_figure(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        fig, chart_type = build_chart(df, "测试")
+        self.assertEqual(chart_type, "bar")
+        self.assertIsNotNone(fig)
+
+    def test_save_chart_writes_html(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        fig, _ = build_chart(df)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_chart(fig, out_dir=tmp)
+            self.assertTrue(os.path.exists(path))
+            self.assertGreater(os.path.getsize(path), 1000)
 
 
 if __name__ == "__main__":
