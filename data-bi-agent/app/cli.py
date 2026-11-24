@@ -64,7 +64,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 """与项目阶段对齐：阶段 6 是计划外增强（CLI 子命令、会话续聊、追问建议）；
 0.7 是改进清单 P1-1（修正回流 teach/lessons）；0.8 是 P1-2（指标归因）。"""
 
