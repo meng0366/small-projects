@@ -8,6 +8,7 @@
 """
 from dataclasses import dataclass
 from functools import cached_property
+import os
 from typing import Optional
 
 import pandas as pd
@@ -27,10 +28,14 @@ class AgentContext:
     """一次会话的静态数据上下文（数据源 + 语义）。"""
     db_name: str = DEFAULT_DB
     csv_name: str = "sales_orders.csv"
+    db_file: Optional[str] = None    # 命令行 `--db` 指定的库文件，优先于 data/ 下的默认库
 
     @cached_property
     def db_path(self) -> Optional[str]:
         """数据库路径；不存在则返回 None（自动降级为单表模式）。"""
+        if self.db_file:
+            path = os.path.abspath(os.path.expanduser(self.db_file))
+            return path if os.path.exists(path) else None
         try:
             return get_db_path(self.db_name)
         except FileNotFoundError:

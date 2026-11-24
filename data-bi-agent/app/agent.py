@@ -60,8 +60,10 @@ class DataAgent:
     状态机编排见 app/graph.py，两者共用同一个 AgentContext。
     """
 
-    def __init__(self, db_name: str = DEFAULT_DB, csv_name: str = "sales_orders.csv"):
-        self.ctx = AgentContext(db_name=db_name, csv_name=csv_name)
+    def __init__(self, db_name: str = DEFAULT_DB, csv_name: str = "sales_orders.csv",
+                 ctx: Optional[AgentContext] = None):
+        # ctx 用于命令行 `--db` 这类自定义数据源；不给则按 db_name 走默认目录
+        self.ctx = ctx or AgentContext(db_name=db_name, csv_name=csv_name)
 
     # ---- 上下文透传（保持既有调用方式不变）----
     @property
