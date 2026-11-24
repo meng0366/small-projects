@@ -135,6 +135,7 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "answer": state.get("answer") or "",
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
+        "suggestions": state.get("suggestions") or [],
     })
 
     # 多轮上下文只保留文字，不带表格（控制 token）
@@ -146,7 +147,7 @@ def answer_question(agent: GraphAgent, question: str) -> None:
 
 
 # ---------------------------------------------------------------- 渲染
-def render_assistant(msg: dict, show_chart: bool, show_code: bool) -> None:
+def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0) -> None:
     df = msg.get("df")
     question = msg.get("question", "")
 
@@ -193,6 +194,17 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool) -> None:
             for err in msg.get("errors") or []:
                 st.caption(f"· {err}")
 
+    # 追问建议：点一下直接接着问，省去自己组织语言（规则生成，不额外耗 token）
+    suggestions = msg.get("suggestions") or []
+    if suggestions:
+        st.caption("可以接着问：")
+        columns = st.columns(len(suggestions))
+        for j, text in enumerate(suggestions):
+            with columns[j]:
+                if st.button(text, key=f"sug_{idx}_{j}", width="stretch"):
+                    st.session_state.pending = text
+                    st.rerun()
+
 
 # ---------------------------------------------------------------- 主流程
 def main() -> None:
@@ -224,13 +236,13 @@ def main() -> None:
         else:
             answer_question(agent, pending or typed)
 
-    for msg in st.session_state.messages:
+    for idx, msg in enumerate(st.session_state.messages):
         avatar = "🧑" if msg["role"] == "user" else "📊"
         with st.chat_message(msg["role"], avatar=avatar):
             if msg["role"] == "user":
                 st.markdown(msg["content"])
             else:
-                render_assistant(msg, show_chart, show_code)
+                render_assistant(msg, show_chart, show_code, idx)
 
     if not st.session_state.messages:
         st.info("在下方输入问题，或点左侧示例问题快速体验。")

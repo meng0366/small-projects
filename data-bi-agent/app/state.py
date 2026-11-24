@@ -41,3 +41,4 @@ class AgentState(TypedDict, total=False):
     chart_path: str                  # 图表 HTML 路径
     chart_type: str                  # 图表类型标识
     answer: str                      # 最终回答（失败时的说明文本）
+    suggestions: List[str]           # 追问建议（规则式生成，阶段 6）

@@ -32,6 +32,7 @@ from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
 from app.tools.sql_tool import run_sql
+from app.tools.suggest_tool import suggest_followups
 
 
 def make_generate_node(ctx: AgentContext):
@@ -194,6 +195,14 @@ class GraphAgent:
             raise
 
         result = state.get("result")
+
+        # 追问建议：纯规则计算（零 token），失败也不该影响本次回答
+        try:
+            state["suggestions"] = suggest_followups(
+                state.get("rewritten_question") or raw_question, result)
+        except Exception:
+            state["suggestions"] = []
+
         log_run(
             ok=result is not None,
             route=state.get("route", ""),
