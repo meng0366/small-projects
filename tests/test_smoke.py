@@ -8,6 +8,7 @@ import unittest
 
 import pandas as pd
 
+from app.agent import DataAgent, to_frame
 from app.nodes.execute import check_safety, execute_code, UnsafeCodeError
 from app.nodes.answer import local_insight, summarize_result
 from app.schema.loader import (
@@ -208,6 +209,25 @@ class TestInsight(unittest.TestCase):
         text = local_insight(self.df)
         self.assertIn("华南", text)
         self.assertIn("300.00", text)
+
+
+class TestAgent(unittest.TestCase):
+    """编排入口的离线部分（不触发 LLM 调用）。"""
+
+    def test_to_frame_from_series(self):
+        s = pd.Series({"华东": 1.0, "华南": 2.0}, name="销售额")
+        df = to_frame(s)
+        self.assertIsInstance(df, pd.DataFrame)
+        self.assertIn("销售额", df.columns)
+
+    def test_to_frame_from_scalar(self):
+        df = to_frame(42.0)
+        self.assertEqual(df.shape, (1, 1))
+
+    def test_mode_label_reports_sqlite(self):
+        agent = DataAgent()
+        self.assertIn("SQLite", agent.mode_label)
+        self.assertIn("表关系", agent.db_schema)
 
 
 if __name__ == "__main__":

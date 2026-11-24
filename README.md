@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 0 | 环境与配置 | ✅ |
 | 1 | 单表问答（Text-to-Pandas，命令行） | ✅ |
-| 2 | 多表 + SQL + 图表 + 洞察 | ⬜ 计划中 |
+| 2 | 多表 SQL + 图表 + 洞察 | ✅ |
 | 3 | LangGraph 编排 + 错误自愈 | ⬜ 计划中 |
 | 4 | Streamlit 界面 | ⬜ 计划中 |
 | 5 | 评测 / 安全加固 / 部署 | ⬜ 计划中 |
@@ -102,35 +102,54 @@ python -m app.cli
 python -m app.cli "各区域的销售额是多少？"
 ```
 
+可选参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--pandas` | 强制走单表 pandas 模式（默认优先 Text-to-SQL） |
+| `--no-chart` | 不生成图表 |
+| `--no-insight` | 不生成洞察文案（省一次模型调用） |
+| `--quiet` | 不打印生成的 SQL / 代码 |
+
 > 请在**项目根目录**下执行以上命令。
+> 图表输出到 `output/`，为独立 HTML，双击即可在浏览器查看。
 
 ## 示例问题
+
+单表（pandas 路径）与多表（SQL 路径）都能回答：
 
 - 各区域的销售额是多少？
 - 销售额最高的前 5 个商品是什么？
 - 每个月的销售额走势如何？
 - 哪个品类的客单价最高？
+- 哪个客户等级的销售额贡献最大？
+- 2025 年总销售额是多少？
 
 ## 项目结构
 
 ```
 app/
 ├── config.py            # 配置与密钥读取
+├── llm.py               # LLM 客户端与代码块清洗
 ├── state.py             # Agent 状态结构
+├── agent.py             # 编排入口（SQL 优先，失败回退 pandas）
 ├── cli.py               # 命令行入口
 ├── graph.py             # LangGraph 状态机（阶段 3）
 ├── main.py              # Streamlit 界面（阶段 4）
 ├── schema/
-│   ├── loader.py        # 数据加载 / Schema 描述 / 业务术语
-│   └── catalog.yaml     # 业务语义词典（字段含义、指标口径）
-├── prompts/templates.py # Prompt 模板（系统指令 + few-shot）
+│   ├── loader.py        # 数据加载 / Schema 描述（DataFrame 版 + 数据库版）
+│   └── catalog.yaml     # 业务语义词典（字段含义、指标口径、枚举值）
+├── prompts/templates.py # Prompt 模板（代码生成 / SQL 生成 / 洞察）
 ├── nodes/
-│   ├── generate.py      # Text-to-Pandas 代码生成
-│   ├── execute.py       # 代码安全执行
+│   ├── generate.py      # Text-to-Pandas 代码生成 + Text-to-SQL 生成
+│   ├── execute.py       # Python 代码安全执行
+│   ├── answer.py        # 结果压缩 + 洞察文案生成
 │   ├── understand.py    # 问题理解（阶段 3）
-│   ├── reflect.py       # 错误反思（阶段 3）
-│   └── answer.py        # 洞察生成（阶段 2）
-└── tools/               # SQL / pandas / 图表工具（阶段 2）
+│   └── reflect.py       # 错误反思（阶段 3）
+└── tools/
+    ├── sql_tool.py      # SQL 安全校验与只读执行
+    ├── chart_tool.py    # 规则式自动选图（Plotly）
+    └── pandas_tool.py   # 预留
 data/
 ├── sales.db             # 模拟销售库（SQLite，3 张关联表）
 ├── sales_orders.csv     # 模拟销售宽表
@@ -142,14 +161,19 @@ tests/
 ## 工作流程
 
 ```
-问题 → 读取 Schema + 业务术语 → LLM 生成 pandas 代码
-     → 安全检查（黑名单 + 语法编译 + 受限命名空间）
-     → 执行 → 格式化输出
+问题
+ ├─ 有数据库 → 生成 SQL → 安全检查（仅单条 SELECT / 只读连接）→ 执行
+ │              └─ 失败 → 自动回退下面的 pandas 路径
+ └─ 回退 / 单表模式 → 生成 pandas 代码
+                      → 安全检查（黑名单 + 语法编译 + 受限命名空间）→ 执行
+ ↓
+结果 DataFrame → 规则式选图（Plotly HTML）+ 统计分析 → LLM 生成中文洞察
 ```
 
 ## 安全说明（重要）
 
-- 生成代码通过 `exec` 执行，已做**轻量防护**（危险调用黑名单、受限内置函数、df 副本），但**不是强隔离**。
+- **SQL 路径**：只读连接（`mode=ro`）+ 仅允许单条 `SELECT` / `WITH` + 关键字黑名单 + 结果行数截断。
+- **pandas 路径**：`exec` 执行已做**轻量防护**（危险调用黑名单、受限内置函数、df 副本），但**不是强隔离**。
 - 当前版本适合**本地单机、可信数据**场景。请勿直接暴露为公网服务。
 - 生产使用前请启用子进程/容器隔离（见路线图阶段 5）。
 - `.env` 已被 `.gitignore` 忽略，请勿提交真实密钥。
