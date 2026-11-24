@@ -25,9 +25,11 @@
 
 ### 1. 获取代码并进入目录
 
+本项目是 [small-projects](https://github.com/meng0366/small-projects) 仓库的子项目：
+
 ```bash
-git clone <your-repo-url> data-bi-agent
-cd data-bi-agent
+git clone https://github.com/meng0366/small-projects.git
+cd small-projects/data-bi-agent
 ```
 
 ### 2. 创建并激活虚拟环境
