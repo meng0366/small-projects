@@ -1,0 +1,17 @@
+# 仓库根的统一换行规则（与 data-bi-agent/.gitattributes 一致）。
+# 根目录下目前只有 README.md 与 .github/workflows/，没有这条规则时
+# core.autocrlf=true 的机器每次提交都会提示"LF 将被替换为 CRLF"。
+* text=auto eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不做换行转换
+*.db binary
+*.sqlite binary
+*.png binary
+*.jpg binary
+*.xlsx binary
+*.ico binary
