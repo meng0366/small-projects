@@ -1,0 +1,49 @@
+# 业务语义词典 —— 供 Agent 理解数据表与业务术语
+# 对应功能 F1.4
+
+tables:
+  - name: orders
+    label: 订单表
+    description: 每一条记录是一笔销售订单，金额字段 amount 为核心指标。
+    columns:
+      order_id: { label: 订单编号, type: string, example: "O00001" }
+      order_date: { label: 下单日期, type: date, example: "2025-03-15" }
+      customer_id: { label: 客户编号, type: string, example: "C001", ref: customers.customer_id }
+      product_id: { label: 商品编号, type: string, example: "P001", ref: products.product_id }
+      quantity: { label: 购买数量, type: int, example: 2 }
+      unit_price: { label: 成交单价, type: float, example: 3999 }
+      discount: { label: 折扣, type: float, example: 0.95, note: "1.0 表示无折扣" }
+      amount: { label: 销售金额, type: float, example: 7598.1, note: "核心指标，单位元" }
+
+  - name: customers
+    label: 客户表
+    description: 客户主数据，含所在区域与客户等级。
+    columns:
+      customer_id: { label: 客户编号, type: string, example: "C001" }
+      customer_name: { label: 客户名称, type: string, example: "上海科技有限公司" }
+      region: { label: 所在区域, type: string, example: "华东", values: [华东, 华南, 华北, 西南, 华中] }
+      customer_level: { label: 客户等级, type: string, example: "重点客户", values: [战略客户, 重点客户, 普通客户] }
+
+  - name: products
+    label: 商品表
+    description: 商品主数据，含品类与标价。
+    columns:
+      product_id: { label: 商品编号, type: string, example: "P001" }
+      product_name: { label: 商品名称, type: string, example: "星云 X1" }
+      category: { label: 商品品类, type: string, example: "手机", values: [手机, 笔记本, 平板, 配件, 智能家居] }
+      unit_price: { label: 商品标价, type: float, example: 3999 }
+
+relationships:
+  - "orders.customer_id -> customers.customer_id (多对一)"
+  - "orders.product_id -> products.product_id (多对一)"
+
+terms:
+  销售额: "orders.amount 求和"
+  订单量: "orders.order_id 计数"
+  销量: "orders.quantity 求和"
+  客单价: "销售额 / 订单量"
+  区域: "customers.region"
+  品类: "products.category"
+  客户等级: "customers.customer_level"
+  同比: "与去年同期对比"
+  环比: "与上一周期对比"

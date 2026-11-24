@@ -1,0 +1,234 @@
+"""离线冒烟测试：不调用 LLM，验证核心模块可用。
+
+运行：python -m unittest discover -s tests -v
+"""
+import os
+import tempfile
+import unittest
+
+import pandas as pd
+
+from app.agent import DataAgent, to_frame
+from app.nodes.execute import check_safety, execute_code, UnsafeCodeError
+from app.nodes.answer import local_insight, summarize_result
+from app.schema.loader import (
+    build_schema_text,
+    load_catalog_terms,
+    get_db_path,
+    list_tables,
+    build_db_schema_text,
+)
+from app.tools.chart_tool import build_chart, detect_chart_type, save_chart
+from app.tools.sql_tool import run_sql
+
+
+class TestSafety(unittest.TestCase):
+    """代码安全检查（借鉴 OpenChatBI 的"校验前置"）。"""
+
+    def test_blocks_os_import(self):
+        with self.assertRaises(UnsafeCodeError):
+            check_safety("import os")
+
+    def test_blocks_file_open(self):
+        with self.assertRaises(UnsafeCodeError):
+            check_safety('result = open("secret.txt").read()')
+
+    def test_blocks_network(self):
+        with self.assertRaises(UnsafeCodeError):
+            check_safety("import requests\nrequests.get('http://x')")
+
+    def test_blocks_syntax_error(self):
+        with self.assertRaises(UnsafeCodeError):
+            check_safety("result = df.groupby(")
+
+    def test_allows_safe_code(self):
+        check_safety('result = df["amount"].sum()')  # 不应抛异常
+
+
+class TestExecute(unittest.TestCase):
+    def setUp(self):
+        self.df = pd.DataFrame({
+            "region": ["华东", "华南", "华东"],
+            "amount": [10.0, 20.0, 30.0],
+        })
+
+    def test_groupby_sum(self):
+        r = execute_code('result = df.groupby("region")["amount"].sum()', self.df)
+        self.assertTrue(r["ok"])
+        self.assertAlmostEqual(float(r["result"]["华东"]), 40.0)
+
+    def test_missing_result(self):
+        r = execute_code("x = 1", self.df)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "result")
+
+    def test_runtime_error(self):
+        r = execute_code('result = df["not_exist"].sum()', self.df)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "runtime")
+
+    def test_original_df_not_modified(self):
+        execute_code('df["new_col"] = 1\nresult = 1', self.df)
+        self.assertNotIn("new_col", self.df.columns)
+
+
+class TestSchema(unittest.TestCase):
+    def test_schema_text_contains_columns(self):
+        df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        text = build_schema_text(df)
+        self.assertIn("a", text)
+        self.assertIn("b", text)
+
+    def test_catalog_terms_is_text(self):
+        self.assertIsInstance(load_catalog_terms(), str)
+
+
+class TestDbSchema(unittest.TestCase):
+    """SQLite 多表接入与 Schema 描述（F1.2 / F1.3）。"""
+
+    def setUp(self):
+        self.db_path = get_db_path()
+
+    def test_list_tables(self):
+        tables = list_tables(self.db_path)
+        for expected in ("orders", "customers", "products"):
+            self.assertIn(expected, tables)
+
+    def test_db_schema_has_relations_and_enums(self):
+        text = build_db_schema_text(self.db_path)
+        self.assertIn("表关系", text)
+        self.assertIn("orders.customer_id -> customers.customer_id", text)
+        # 枚举值必须显式给出，避免模型臆造字面量
+        self.assertIn("华东", text)
+        self.assertIn("笔记本", text)
+
+    def test_db_schema_mentions_row_count(self):
+        text = build_db_schema_text(self.db_path)
+        self.assertIn("3877 行", text)
+
+
+class TestSqlTool(unittest.TestCase):
+    """SQL 安全校验与只读执行（F2.3 / F2.4）。"""
+
+    def setUp(self):
+        self.db_path = get_db_path()
+
+    def test_select_runs(self):
+        r = run_sql("SELECT region, COUNT(*) AS n FROM customers GROUP BY region",
+                    self.db_path)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["rows"], 5)
+
+    def test_blocks_delete(self):
+        r = run_sql("DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "safety")
+
+    def test_blocks_multiple_statements(self):
+        r = run_sql("SELECT 1; DROP TABLE orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_blocks_comment_bypass(self):
+        r = run_sql("SELECT 1 /* x */; DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_blocks_pragma(self):
+        r = run_sql("PRAGMA table_info(orders)", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_with_delete_blocked(self):
+        r = run_sql("WITH t AS (SELECT 1) DELETE FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+
+    def test_truncation(self):
+        r = run_sql("SELECT * FROM orders", self.db_path, max_rows=10)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["rows"], 10)
+        self.assertTrue(r["truncated"])
+
+    def test_runtime_error_reported(self):
+        r = run_sql("SELECT not_a_column FROM orders", self.db_path)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["stage"], "runtime")
+
+
+class TestChart(unittest.TestCase):
+    """自动选图规则（F2.5）。"""
+
+    def test_time_series_picks_line(self):
+        df = pd.DataFrame({"月份": ["2025-01", "2025-02"], "销售额": [1.0, 2.0]})
+        self.assertEqual(detect_chart_type(df), "line")
+
+    def test_category_picks_bar(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        self.assertEqual(detect_chart_type(df), "bar")
+
+    def test_share_picks_pie(self):
+        df = pd.DataFrame({"品类": ["手机", "平板"], "销售占比": [60.0, 40.0]})
+        self.assertEqual(detect_chart_type(df), "pie")
+
+    def test_single_value_no_chart(self):
+        df = pd.DataFrame({"总销售额": [123.0]})
+        self.assertEqual(detect_chart_type(df), "none")
+
+    def test_build_chart_returns_figure(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        fig, chart_type = build_chart(df, "测试")
+        self.assertEqual(chart_type, "bar")
+        self.assertIsNotNone(fig)
+
+    def test_save_chart_writes_html(self):
+        df = pd.DataFrame({"区域": ["华东", "华南"], "销售额": [1.0, 2.0]})
+        fig, _ = build_chart(df)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_chart(fig, out_dir=tmp)
+            self.assertTrue(os.path.exists(path))
+            self.assertGreater(os.path.getsize(path), 1000)
+
+
+class TestInsight(unittest.TestCase):
+    """结果压缩与本地兜底结论（F2.6，不调用 LLM）。"""
+
+    def setUp(self):
+        self.df = pd.DataFrame({
+            "区域": ["华东", "华南"],
+            "销售额": [100.0, 300.0],
+        })
+
+    def test_summary_contains_shape_and_sum(self):
+        text = summarize_result(self.df)
+        self.assertIn("2 行", text)
+        self.assertIn("400.00", text)      # 合计
+        self.assertIn("华南", text)         # 明细
+
+    def test_summary_empty_df(self):
+        text = summarize_result(pd.DataFrame())
+        self.assertIn("0 行", text)
+
+    def test_local_insight_names_top_item(self):
+        text = local_insight(self.df)
+        self.assertIn("华南", text)
+        self.assertIn("300.00", text)
+
+
+class TestAgent(unittest.TestCase):
+    """编排入口的离线部分（不触发 LLM 调用）。"""
+
+    def test_to_frame_from_series(self):
+        s = pd.Series({"华东": 1.0, "华南": 2.0}, name="销售额")
+        df = to_frame(s)
+        self.assertIsInstance(df, pd.DataFrame)
+        self.assertIn("销售额", df.columns)
+
+    def test_to_frame_from_scalar(self):
+        df = to_frame(42.0)
+        self.assertEqual(df.shape, (1, 1))
+
+    def test_mode_label_reports_sqlite(self):
+        agent = DataAgent()
+        self.assertIn("SQLite", agent.mode_label)
+        self.assertIn("表关系", agent.db_schema)
+
+
+if __name__ == "__main__":
+    unittest.main()
