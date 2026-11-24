@@ -13,7 +13,7 @@
 | 2 | 多表 SQL + 图表 + 洞察 | ✅ |
 | 3 | LangGraph 编排 + 错误自愈 + 多轮记忆 | ✅ |
 | 4 | Streamlit 网页界面 | ✅ |
-| 5 | 评测 / 安全加固 / 部署 | ⬜ 计划中 |
+| 5 | 评测 / 安全加固 / 部署 | ✅ |
 
 ## 环境要求
 
@@ -166,11 +166,12 @@ streamlit run app/main.py
 
 ```
 app/
-├── config.py            # 配置与密钥读取
+├── config.py            # 配置与密钥读取（环境变量 / .env / st.secrets）+ 安全限额
 ├── llm.py               # LLM 客户端与代码块清洗
 ├── context.py           # 运行时上下文（数据/Schema/术语，惰性加载）
 ├── state.py             # AgentState 状态结构
-├── graph.py             # LangGraph 状态机（含重试环）
+├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
+├── logging_utils.py     # 运行日志与 token 计数（成本监控）
 ├── agent.py             # 线性编排（--linear 时使用）
 ├── cli.py               # 命令行入口
 ├── main.py              # Streamlit 网页界面（聊天式问答）
@@ -181,21 +182,30 @@ app/
 ├── nodes/
 │   ├── understand.py    # 问题理解：多轮改写 + 路由判定
 │   ├── generate.py      # Text-to-Pandas / Text-to-SQL 生成
-│   ├── execute.py       # Python 代码安全执行
+│   ├── execute.py       # Python 代码安全执行（AST 校验 + 超时 + 截断）
 │   ├── reflect.py       # 反思重试与换路
 │   └── answer.py        # 结果压缩 + 洞察生成
 └── tools/
-    ├── sql_tool.py      # SQL 安全校验与只读执行
+    ├── sql_tool.py      # SQL 安全校验与只读执行（含查询超时）
     ├── chart_tool.py    # 规则式自动选图（Plotly）
     └── pandas_tool.py   # 预留
 data/
 ├── sales.db             # 模拟销售库（SQLite，3 张关联表）
 ├── sales_orders.csv     # 模拟销售宽表
 └── generate_mock_data.py # 模拟数据生成脚本
+evals/
+├── cases.yaml           # 43 条评测用例（问题 + 金标准 SQL + 判定方式）
+├── judge.py             # 判分器（数值容差、列名/列顺序无关）
+├── run_eval.py          # 跑评测并产出报告
+└── reports/             # 评测报告（仅 baseline 入库，临时报告已忽略）
 tests/
 ├── test_smoke.py        # 离线冒烟测试（34 个用例）
 ├── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
-└── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
+├── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
+├── test_eval.py         # 评测集与判分测试（22 个用例）
+└── test_security.py     # 安全防护测试（16 个用例）
+Dockerfile               # 单镜像部署（含中文字体与健康检查）
+.streamlit/config.toml   # 界面主题与服务器配置
 ```
 
 ## 工作流程
@@ -215,11 +225,33 @@ execute：SQL 走只读库 / 代码走受限命名空间
 
 ## 安全说明（重要）
 
-- **SQL 路径**：只读连接（`mode=ro`）+ 仅允许单条 `SELECT` / `WITH` + 关键字黑名单 + 结果行数截断。
-- **pandas 路径**：`exec` 执行已做**轻量防护**（危险调用黑名单、受限内置函数、df 副本），但**不是强隔离**。
-- 当前版本适合**本地单机、可信数据**场景。请勿直接暴露为公网服务。
-- 生产使用前请启用子进程/容器隔离（见路线图阶段 5）。
-- `.env` 已被 `.gitignore` 忽略，请勿提交真实密钥。
+本项目按「本地单机、可信数据」设计，做了能落地的防护，但**不是强隔离沙箱**。上线到公网前请读完本节。
+
+**SQL 路径（较严格）**
+
+- 只读连接：`file:...?mode=ro`，写操作在连接层就被 SQLite 拒绝；
+- 只放行单条 `SELECT` / `WITH`，先剥注释再校验，防止用注释夹带关键字；
+- 14 个修改/危险关键字黑名单（`insert`/`drop`/`attach`/`pragma`/`load_extension` 等）；
+- 查询超时（默认 10 秒）：用 SQLite progress handler 中断，挡误写的笛卡尔积；
+- 结果行数上限（默认 200 行/次）。
+
+**pandas 路径（尽力防护，非强隔离）**
+
+- **AST 静态校验**：禁止 `import`、禁止访问下划线开头的内部属性（挡 `().__class__.__bases__` 逃逸链）、
+  禁止 `to_csv`/`to_excel`/`to_sql` 等写盘方法、禁止 `eval`/`exec`/`open`/`getattr` 等名字；
+  代码复杂度上限 4000 个语法节点；
+- **受限命名空间**：只注入白名单内置函数，`df` 传副本，原始数据不会被改；
+- **执行超时**（默认 20 秒）：代码跑在守护线程里，死循环不会卡死会话。
+
+  > 已知局限：Python 无法强杀线程。若生成代码是不释放 GIL 的 C 层紧密计算（如 `sum(range(10**8))`），
+  > 主线程要等它跑完才恢复。死循环、pandas/numpy 长任务这类真正会「卡死会话」的场景不受影响。
+  > 需要强隔离请用下面的 Docker 方案，并对容器做 CPU / 内存限制。
+
+**通用**
+
+- 单次提问上限 2000 字符，运行日志只记问题前 200 字与指标，不落原始数据；
+- 网页端默认每个会话最多 50 次提问（`AGENT_MAX_QUESTIONS` 可调），防止公开部署被刷额度；
+- `.env` 已被 `.gitignore` 忽略；云端部署用平台 secrets 或环境变量，不要提交密钥。
 
 ## 测试
 
@@ -229,13 +261,100 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 43 个用例，覆盖：
+共 90 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
 | `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
 | `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级（全部 mock LLM） |
 | `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递（全部 mock LLM） |
+| `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容） |
+| `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
+| `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、容器文件与忽略规则、Streamlit 配置解析 |
+
+## 评测
+
+评测集用「问题 + 金标准 SQL」的方式建：标准答案由 SQL 在同一个库上现算，不手写，避免抄错；
+判分只比结果值，不比列名与列顺序，因此模型用什么别名都不影响对错。
+
+```bash
+# 1. 先校验评测集（只跑金标准 SQL，不调用模型、不花钱）
+python -m evals.run_eval --dry-run
+
+# 2. 跑全量 43 条（会真实调用模型）
+python -m evals.run_eval --tag baseline
+
+# 3. 只跑某几条 / 某个分类
+python -m evals.run_eval --only A01,B01,G01
+python -m evals.run_eval --category 多轮追问
+```
+
+最近一次基线（`deepseek-chat`，43 条，洞察与图表关闭）：
+
+| 指标 | 结果 |
+| --- | --- |
+| 准确率 | **43/43（100%）** |
+| 执行成功率 | 43/43（100%） |
+| 一次通过率 | 43/43（100%，无重试） |
+| 平均耗时 | 0.9 秒/题；P95 1.4 秒 |
+| 模型调用 | 46 次，输入 123,337 / 输出 2,359 tokens |
+
+用例覆盖九类：总量指标（5）、维度汇总（7）、排名 Top-N（5）、条件筛选（6）、业务口径（4）、
+时间趋势（3）、复杂推理（8，含环比增长率、分组 Top-1、周末对比）、多轮追问（3）、口语表达（2）。
+
+> **怎么读这个 100%**：它说明这套数据上的确定性查询类问题已经稳定，**不代表开放域提问都能答对**。
+> 这批题目偏基础、且 schema 只有 3 张表；表变多、口径变模糊时准确率会下降。
+> 评测集的价值在于「改 prompt / 换模型后能立刻看出有没有退化」，而不是拿满分当结论。
+> 另：本次全部一次成功，重试链路未被触发，其行为由 `tests/test_graph.py` 的 mock 用例覆盖。
+
+## 部署
+
+### 方式一：Streamlit Community Cloud（最快，免费）
+
+1. Fork / 推送本仓库到 GitHub；
+2. 打开 [share.streamlit.io](https://share.streamlit.io)，新建 App，指向仓库与 `app/main.py`；
+3. 在 **App settings → Secrets** 里填：
+
+   ```toml
+   DEEPSEEK_API_KEY = "sk-你的密钥"
+   DEEPSEEK_MODEL = "deepseek-chat"
+   ```
+
+   代码会按「环境变量 → .env → st.secrets」的顺序读配置，云端无需 `.env` 文件。
+4. 部署完成后即可通过链接访问。模拟数据随仓库分发，无需额外准备。
+
+> 注意：Streamlit Cloud 的免费实例是公开的，任何人都能用你的 Key 提问。
+> 建议把 `AGENT_MAX_QUESTIONS` 调小（如 20），并在 DeepSeek 后台设置额度上限。
+
+### 方式二：Docker（推荐用于服务器）
+
+```bash
+docker build -t data-bi-agent .
+docker run --rm -p 8501:8501 \
+  -e DEEPSEEK_API_KEY=sk-你的密钥 \
+  --cpus=1 --memory=1g \
+  data-bi-agent
+```
+
+打开 http://localhost:8501 。镜像内置中文字体，健康检查走 `/_stcore/health`。
+
+`--cpus` / `--memory` 不是可选项：pandas 执行路径不是强隔离沙箱，
+限制容器资源能兜住「生成代码把机器跑满」的最坏情况。
+
+### 方式三：本机直接跑
+
+```bash
+streamlit run app/main.py
+```
+
+默认 http://localhost:8501 ，密钥从 `.env` 读取。
+
+### 部署前检查清单
+
+- [ ] 密钥没有写进代码或提交历史（`git grep "sk-"` 应只命中 `.env.example` 的占位符）
+- [ ] `AGENT_MAX_QUESTIONS` 已按公开程度设置
+- [ ] 平台侧已设额度/告警，避免被刷
+- [ ] 数据是模拟数据；换真实数据前确认脱敏与访问权限
 
 ## 设计参考
 
