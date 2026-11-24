@@ -113,6 +113,29 @@ class TestWebUI(unittest.TestCase):
         self.assertEqual(seen, [("各区域的销售额是多少？", 0), ("只看华东", 2)])
         self.assertTrue(any("结合上下文理解为" in c.value for c in at.caption))
 
+    def test_suggestion_buttons_start_next_question(self):
+        """追问建议按钮点一下就能提问（pending → 重跑 → 正常问答链路）。"""
+        at = self._app()
+        state_with_suggestions = dict(
+            FAKE_STATE,
+            suggestions=["各品类的销售额是多少？", "每个月的销售额走势如何？"],
+        )
+        asked = []
+
+        def fake_run(question, history):
+            asked.append(question)
+            return state_with_suggestions
+
+        with mock.patch("app.graph.GraphAgent.run", side_effect=fake_run):
+            at.chat_input[0].set_value("各区域的销售额是多少？").run()
+            self.assertEqual(len(at.exception), 0)
+            self.assertTrue(any("可以接着问" in c.value for c in at.caption))
+            # 消息顺序是「用户(idx 0) + 助手(idx 1)」，建议按钮 key 用助手消息下标
+            at.button(key="sug_1_0").click().run()
+
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual(asked, ["各区域的销售额是多少？", "各品类的销售额是多少？"])
+
 
 if __name__ == "__main__":
     unittest.main()
