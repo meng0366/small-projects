@@ -21,8 +21,14 @@ tables:
     columns:
       customer_id: { label: 客户编号, type: string, example: "C001" }
       customer_name: { label: 客户名称, type: string, example: "上海科技有限公司" }
-      region: { label: 所在区域, type: string, example: "华东", values: [华东, 华南, 华北, 西南, 华中] }
-      customer_level: { label: 客户等级, type: string, example: "重点客户", values: [战略客户, 重点客户, 普通客户] }
+      # hints 是该列在**用户提问**里常见的线索词，供"取值校验"判断用户是否说了个库里没有的值：
+      # 如"办公用品类产品"命中 hints[类]，取出候选值"办公用品"，库里没有 → 触发澄清而不是硬映射。
+      region:
+        { label: 所在区域, type: string, example: "华东",
+          values: [华东, 华南, 华北, 西南, 华中], hints: [地区, 区域, 省份, 城市] }
+      customer_level:
+        { label: 客户等级, type: string, example: "重点客户",
+          values: [战略客户, 重点客户, 普通客户], hints: [客户等级, 等级, 级别] }
 
   - name: products
     label: 商品表
@@ -30,7 +36,9 @@ tables:
     columns:
       product_id: { label: 商品编号, type: string, example: "P001" }
       product_name: { label: 商品名称, type: string, example: "星云 X1" }
-      category: { label: 商品品类, type: string, example: "手机", values: [手机, 笔记本, 平板, 配件, 智能家居] }
+      category:
+        { label: 商品品类, type: string, example: "手机",
+          values: [手机, 笔记本, 平板, 配件, 智能家居], hints: [品类, 分类, 类目, 类] }
       unit_price: { label: 商品标价, type: float, example: 3999 }
 
 relationships:

@@ -108,7 +108,12 @@ class TestGraphFlow(unittest.TestCase):
         self.assertEqual(len(state["result"]), 0)
         self.assertEqual(state["chart_type"], "none")
         self.assertIn("没有匹配到数据", state["answer"])
-        self.assertIn("放宽条件", state["answer"])
+        # 两轮语句相同（mock 固定返回同一条 SQL）→ 文案要说清"条件没错，是真没数据"，
+        # 而不是含糊的"已尝试放宽"，否则用户以为系统改过条件还在白查
+        self.assertIn("完全一致", state["answer"])
+        # 空结果必须摆出库里的真实范围，不能让用户自己猜（P0-1b）
+        self.assertIn("2025-01-01", state["answer"])
+        self.assertIn("配件", state["answer"])
 
     def test_empty_result_not_retried_when_budget_zero(self):
         """max_retries=0 时应直接如实说明，不重试。"""
@@ -130,6 +135,62 @@ class TestGraphFlow(unittest.TestCase):
         self.assertFalse(is_empty_result(pd.DataFrame({"a": [1]})))   # 有数据
         self.assertTrue(is_empty_result(pd.Series(dtype="float64")))  # 空序列
         self.assertFalse(is_empty_result(0))                          # 标量 0 不是空
+
+    def test_is_aggregate_empty_helper(self):
+        """聚合空（1 行 NULL）要识别出来，但 0 和正常值不能误判。"""
+        import pandas as pd
+        from app.nodes.reflect import is_aggregate_empty
+
+        self.assertTrue(is_aggregate_empty(pd.DataFrame({"总销售额": [None]})))
+        self.assertTrue(is_aggregate_empty(pd.DataFrame({"最大日期": [pd.NaT]})))
+        # COUNT(*)=0 是有效答案（确实 0 笔），不能算空
+        self.assertFalse(is_aggregate_empty(pd.DataFrame({"客户数": [0]})))
+        self.assertFalse(is_aggregate_empty(pd.DataFrame({"总销售额": [123.4]})))
+        # 0 行由 is_empty_result 负责；多种形状、None 都不算聚合空
+        self.assertFalse(is_aggregate_empty(pd.DataFrame()))
+        self.assertFalse(is_aggregate_empty(pd.DataFrame({"a": [None], "b": [None]})))
+        self.assertFalse(is_aggregate_empty(None))
+
+    def test_aggregate_empty_answered_without_retry(self):
+        """聚合查询无匹配（SUM 返回 1 行 NULL）不该重试，直接摆事实。
+
+        这是真实试跑发现的漏判：`df.empty` 是 False，旧逻辑把它当"有结果"，
+        交给 LLM 圆成"数据缺失或需核查数据源"。
+        """
+        import pandas as pd
+        calls = []
+
+        def counting_sql(schema, terms, question, previous_error=None, previous_empty=False):
+            calls.append(question)
+            return "SELECT SUM(amount) FROM orders WHERE order_date < '2024-01-01'"
+
+        agent = G.GraphAgent(with_chart=False, with_insight=False, max_retries=2)
+        with mock.patch.object(G, "generate_sql", side_effect=counting_sql):
+            with mock.patch.object(G, "run_sql",
+                                   return_value={"ok": True,
+                                                 "df": pd.DataFrame({"总销售额": [None]}),
+                                                 "sql": "SELECT 1", "rows": 1}):
+                state = agent.run("2024 年全年总销售额是多少？")
+
+        self.assertEqual(len(calls), 1)              # 一次就够，不浪费第二轮
+        self.assertEqual(state["retry_count"], 0)
+        self.assertIn("没有匹配到数据", state["answer"])
+        self.assertIn("2025-01-01", state["answer"])  # 告诉用户数据从哪年开始
+        self.assertEqual(state["chart_type"], "none")
+
+    def test_count_zero_is_still_a_valid_answer(self):
+        """COUNT(*)=0 不能当空结果 —— "没有客户"本身就是答案。"""
+        import pandas as pd
+        agent = G.GraphAgent(with_chart=False, with_insight=False, max_retries=2)
+        with mock.patch.object(G, "generate_sql",
+                              return_value="SELECT COUNT(*) FROM customers WHERE region='东北'"):
+            with mock.patch.object(G, "run_sql",
+                                   return_value={"ok": True,
+                                                 "df": pd.DataFrame({"客户数": [0]}),
+                                                 "sql": "SELECT 1", "rows": 1}):
+                state = agent.run("东北地区有多少客户？")
+        self.assertEqual(state["retry_count"], 0)
+        self.assertNotIn("没有匹配到数据", state["answer"])
 
     def test_pandas_only_mode_without_db(self):
         """数据库缺失时应直接走 pandas。"""

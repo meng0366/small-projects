@@ -30,6 +30,7 @@ from app.nodes.generate import generate_code, generate_sql
 from app.nodes.reflect import (
     EMPTY_RESULT_NOTE,
     DEFAULT_MAX_RETRIES,
+    is_aggregate_empty,
     is_empty_result,
     make_reflect_node,
     route_after_execute,
@@ -37,6 +38,7 @@ from app.nodes.reflect import (
 from app.nodes.understand import make_understand_node
 from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
+from app.tools.enum_guard import build_clarify_answer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -75,26 +77,64 @@ def make_execute_node(ctx: AgentContext):
 
     def node(state: AgentState) -> dict:
         statement = state.get("statement")
+        # 记下每轮语句：answer 节点据此判断"重试时到底有没有改过条件"
+        statements = list(state.get("statements") or [])
+        if statement:
+            statements.append(statement)
+        history = {"statements": statements}
+
         if not statement:
-            return {"result": None, "error": state.get("error") or "未生成可执行语句"}
+            return {"result": None, "error": state.get("error") or "未生成可执行语句",
+                    **history}
 
         if state.get("route") == "sql" and ctx.has_db:
             r = run_sql(statement, ctx.db_path)
             if r["ok"]:
                 empty = is_empty_result(r["df"])
-                return {"result": r["df"], "error": None, "empty_result": empty}
+                return {"result": r["df"], "error": None, "empty_result": empty, **history}
             return {"result": None, "error": f"SQL {r['stage']} 阶段：{r['error']}",
-                    "empty_result": False}
+                    "empty_result": False, **history}
 
         r = execute_code(statement, ctx.df)
         if r["ok"]:
             frame = to_frame(r["result"])
             empty = is_empty_result(frame)
-            return {"result": frame, "error": None, "empty_result": empty}
+            return {"result": frame, "error": None, "empty_result": empty, **history}
         return {"result": None, "error": f"代码 {r['stage']} 阶段：{r['error']}",
-                "empty_result": False}
+                "empty_result": False, **history}
 
     return node
+
+
+def build_empty_answer(ctx: AgentContext, state: AgentState, aggregate: bool) -> str:
+    """空结果的如实说明：不编原因，摆事实（库里到底覆盖了什么）。
+
+    真实试跑暴露过两个问题，这段文案是针对性的：
+    - 聚合空（SUM 返回 NULL）曾被 LLM 说成"数据缺失或需核查数据源"，把用户引向错误方向；
+    - 只给"可能原因"（取值不一致/时间超范围）不够，用户还得自己猜库里有啥。
+    所以直接把实测取值与时间范围摆出来，让用户一眼看出该换成什么条件。
+    """
+    retried = bool(state.get("empty_retried"))
+    statements = state.get("statements") or []
+    unchanged = len(statements) >= 2 and statements[-1] == statements[-2]
+
+    parts = ["查询已执行成功，但当前条件下没有匹配到数据。"]
+    if retried and unchanged:
+        parts.append("系统自动复核了一次：重试的查询条件与首次完全一致，"
+                     "说明条件本身没写错，是这个范围确实没有数据。")
+    elif retried:
+        parts.append("系统已自动放宽条件重查一次，结果仍为空。")
+
+    profile = ctx.data_profile_text
+    if profile:
+        parts.append("")
+        parts.append("库里实际覆盖的范围：")
+        parts.append(profile)
+
+    parts.append("")
+    parts.append("可以按上面列出的取值或时间范围换个条件再问；"
+                 "如果确认要的就是这个范围，那就是没有数据。")
+    return "\n".join(parts)
 
 
 def make_answer_node(ctx: AgentContext, with_chart: bool = True,
@@ -114,17 +154,12 @@ def make_answer_node(ctx: AgentContext, with_chart: bool = True,
                 answer += f"（共尝试 {len(errors)} 次）"
             return {"insight": "", "answer": answer, "chart_type": "none", "chart_path": ""}
 
-        # 空结果：执行成功但没数据。已经自动重试过一次（放宽条件）仍为空，
-        # 就如实说明，不再让模型"编"一段洞察 —— 空表没什么可洞察的，还容易胡编。
-        if is_empty_result(result):
-            retried = bool(state.get("empty_retried"))
-            answer = "查询已执行成功，但当前条件下没有匹配到数据。"
-            answer += ("已自动尝试放宽条件重查一次，仍为空；"
-                       if retried else "")
-            answer += ("可能原因：筛选条件过严或条件叠加后无交集、"
-                       "地区/品类/客户等级等取值与库中写法不一致、"
-                       "或所问时间段超出数据覆盖范围（本库为 2025 年数据）。"
-                       "可以换个时间段或减少筛选条件再问。")
+        # 空结果：执行成功但没数据。分两种表现，处置相同、说明不同：
+        # - 0 行（明细型，已自动放宽重试过一次）；
+        # - 1 行 NULL（聚合型，如 SUM 无匹配，按策略不重试）。
+        # 两种情况都不让模型"编洞察" —— 空结果没什么可洞察的，还容易胡编。
+        if is_empty_result(result) or is_aggregate_empty(result):
+            answer = build_empty_answer(ctx, state, aggregate=is_aggregate_empty(result))
             return {"insight": answer, "answer": answer,
                     "chart_type": "none", "chart_path": ""}
 
@@ -149,6 +184,26 @@ def make_answer_node(ctx: AgentContext, with_chart: bool = True,
     return node
 
 
+def make_clarify_node(ctx: AgentContext):
+    """澄清节点：用户问的取值库里没有时，直接说明并给出可选值（P0-1b）。
+
+    不再走生成：模型知道取值列表，但遇到对不上的词会自己挑个"最近的"
+    （"办公用品"→"配件"），产出的数字口径是错的，比不回答更糟。
+    """
+
+    def node(state: AgentState) -> dict:
+        answer = build_clarify_answer(state.get("unknown_enum") or {})
+        return {"answer": answer, "insight": answer,
+                "chart_type": "none", "chart_path": "", "result": None}
+
+    return node
+
+
+def route_after_understand(state: AgentState) -> str:
+    """条件边：取值对不上先澄清，对得上才去生成。"""
+    return "clarify" if state.get("unknown_enum") else "generate"
+
+
 def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
                 with_insight: bool = True, max_retries: int = DEFAULT_MAX_RETRIES):
     """编译状态机，返回可直接 invoke 的 graph。"""
@@ -156,13 +211,17 @@ def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
 
     builder = StateGraph(AgentState)
     builder.add_node("understand", make_understand_node(ctx))
+    builder.add_node("clarify", make_clarify_node(ctx))
     builder.add_node("generate", make_generate_node(ctx))
     builder.add_node("execute", make_execute_node(ctx))
     builder.add_node("reflect", make_reflect_node(ctx))
     builder.add_node("answer", make_answer_node(ctx, with_chart, with_insight))
 
     builder.add_edge(START, "understand")
-    builder.add_edge("understand", "generate")
+    builder.add_conditional_edges(
+        "understand", route_after_understand,
+        {"generate": "generate", "clarify": "clarify"})
+    builder.add_edge("clarify", END)
     builder.add_edge("generate", "execute")
     builder.add_conditional_edges(
         "execute", route_after_execute, {"answer": "answer", "reflect": "reflect"})
@@ -226,20 +285,28 @@ class GraphAgent:
             raise
 
         result = state.get("result")
+        unknown = state.get("unknown_enum")
 
         # 追问建议：纯规则计算（零 token），失败也不该影响本次回答
         try:
-            state["suggestions"] = suggest_followups(
-                state.get("rewritten_question") or raw_question, result)
+            if unknown:
+                # 澄清场景下通用建议没意义，直接把可选值做成能点的问题
+                state["suggestions"] = [
+                    f"{v}的销售额是多少？"
+                    for v in (unknown.get("values") or [])[:3]]
+            else:
+                state["suggestions"] = suggest_followups(
+                    state.get("rewritten_question") or raw_question, result)
         except Exception:
             state["suggestions"] = []
 
         log_run(
-            ok=result is not None,
+            ok=result is not None or bool(unknown),
+            clarify=bool(unknown),
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),
-            empty=is_empty_result(result),
+            empty=is_empty_result(result) or is_aggregate_empty(result),
             chart=state.get("chart_type", ""),
             elapsed=round(time.perf_counter() - started, 2),
             question=raw_question[:200],

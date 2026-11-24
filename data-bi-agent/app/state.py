@@ -25,9 +25,11 @@ class AgentState(TypedDict, total=False):
     schema_info: str                 # 当前路径对应的表结构描述
     terms: str                       # 业务术语口径
     route: str                       # "sql" | "pandas"
+    unknown_enum: Any                # 用户提到的枚举值库里没有时，记录澄清信息（P0-1b）
 
     # ---- 生成与执行 ----
     statement: str                   # 生成的 SQL 或 Python 代码
+    statements: List[str]            # 历次生成的语句（判断"重试是否真的改过"，P0-1b）
     result: Any                      # 执行结果（DataFrame）
 
     # ---- 错误与重试 ----

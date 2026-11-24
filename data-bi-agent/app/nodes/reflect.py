@@ -12,9 +12,17 @@
    只把"结果为空、请核对取值并放宽条件"回喂一次。
    只给一次机会：若放宽后仍为空，说明该条件下确实没有数据，如实告诉用户，
    而不是反复空转烧 token。
+4. **聚合型空结果不重试**（P0-1b，真实试跑后补）：
+   `SUM/AVG/MAX` 在没有匹配行时不返回 0 行，而是**返回一行 NULL**，
+   所以 `df.empty` 是 False，只看行数会把"其实没数据"当成有结果。
+   而这类问题一旦去"放宽条件"，WHERE 一松就会把别的时段、别的地区的数
+   算进同一个指标 —— 用户看到的仍是一个像样的金额，错得毫无痕迹。
+   因此聚合空一律如实说明、不重试（`COUNT(*)` 返回 0 属有效答案，不算空）。
 
 重试次数由 state.max_retries 控制（默认 2）。
 """
+import pandas as pd
+
 from app.context import AgentContext
 from app.state import AgentState
 
@@ -41,6 +49,29 @@ def is_empty_result(result) -> bool:
     try:
         return len(result) == 0
     except TypeError:
+        return False
+
+
+def is_aggregate_empty(result) -> bool:
+    """聚合查询的"无数据"是另一个样子：1 行 1 列，但值是 NULL。
+
+    `SUM/AVG/MAX` 在没有匹配行时不返回 0 行，而返回一行 NULL，
+    所以 `df.empty` 是 False —— 只按行数判断会把"其实没数据"当成有结果。
+    真实试跑里"2024 年总销售额"就是这样漏判的：LLM 对着 None 编出
+    "数据缺失或未成功汇总，需核查数据源"，把用户引向错误方向。
+
+    只认 NULL/NaN，**不认 0**：`COUNT(*)` 无匹配返回 0，那是有效答案（确实 0 笔），
+    `SUM` 有行但金额都是 0 也返回 0，同样不能说"没数据"。
+    """
+    if result is None or getattr(result, "shape", None) != (1, 1):
+        return False
+    try:
+        value = result.iloc[0, 0]
+    except Exception:
+        return False
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
         return False
 
 
@@ -87,16 +118,20 @@ def make_reflect_node(ctx: AgentContext, fallback_route: str = FALLBACK_ROUTE):
 def route_after_execute(state: AgentState) -> str:
     """条件边：执行后决定去回答还是去反思重试。
 
-    三种情况：
-    - 有非空结果 → 直接回答；
-    - 空结果且还没因空结果重试过 → 反思一次（放宽条件）；
-    - 空结果但已经重试过 / 出错且重试次数用尽 → 回答（如实说明没数据或失败）。
+    四种情况：
+    - 聚合型空（1 行 NULL，如 SUM 无匹配）→ 直接回答，**不重试**：
+      放宽条件会把别的时段/地区的数算进同一个指标，产出"看起来正常"的错数；
+    - 明细型空（0 行）且还没因空结果重试过 → 反思一次（放宽条件）；
+    - 明细型空但已重试过 / 重试次数用尽 → 回答（如实说明没数据）；
+    - 真出错（result 为 None）→ 还有次数就反思（换路），否则回答失败说明。
     """
     result = state.get("result")
     retry_count = state.get("retry_count", 0)
     max_retries = state.get("max_retries", DEFAULT_MAX_RETRIES)
 
     if result is not None:
+        if is_aggregate_empty(result):
+            return "answer"
         if is_empty_result(result) and not state.get("empty_retried") \
                 and retry_count < max_retries:
             return "reflect"

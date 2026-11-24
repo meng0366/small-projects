@@ -17,7 +17,10 @@ from app.schema.loader import (
     DEFAULT_DB,
     build_db_schema_text,
     build_schema_text,
+    collect_data_profile,
+    format_data_profile,
     get_db_path,
+    load_catalog,
     load_catalog_terms,
     load_dataframe,
 )
@@ -48,6 +51,23 @@ class AgentContext:
     @cached_property
     def terms(self) -> str:
         return load_catalog_terms()
+
+    @cached_property
+    def data_profile(self) -> dict:
+        """实测的数据画像：日期覆盖范围 + 枚举列真实取值（P0-1b）。
+
+        与 db_schema 的分工：schema 说明"表怎么建的"，画像说明"库里实际有什么"。
+        空结果复核、取值澄清都基于事实，而不是猜。
+        """
+        return collect_data_profile(self.db_path, self.catalog) if self.db_path else {}
+
+    @cached_property
+    def data_profile_text(self) -> str:
+        return format_data_profile(self.data_profile)
+
+    @cached_property
+    def catalog(self) -> dict:
+        return load_catalog()
 
     @cached_property
     def df(self) -> pd.DataFrame:

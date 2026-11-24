@@ -283,15 +283,16 @@ app/
 │   └── catalog.yaml     # 业务语义词典（字段含义、指标口径、枚举值）
 ├── prompts/templates.py # Prompt 模板（代码/SQL/洞察/问题改写/错误修正）
 ├── nodes/
-│   ├── understand.py    # 问题理解：多轮改写 + 路由判定
+│   ├── understand.py    # 问题理解：多轮改写 + 路由判定 + 取值校验
 │   ├── generate.py      # Text-to-Pandas / Text-to-SQL 生成
 │   ├── execute.py       # Python 代码安全执行（AST 校验 + 超时 + 截断）
-│   ├── reflect.py       # 反思重试与换路
+│   ├── reflect.py       # 反思重试与换路、空结果判定
 │   └── answer.py        # 结果压缩 + 洞察生成
 └── tools/
     ├── sql_tool.py      # SQL 安全校验与只读执行（含查询超时）
     ├── chart_tool.py    # 规则式自动选图（Plotly）
     ├── suggest_tool.py  # 追问建议（规则式，零 token）
+    ├── enum_guard.py    # 取值校验：库里没有的值先澄清，不硬映射（规则式，零 token）
     └── pandas_tool.py   # 预留
 data/
 ├── sales.db             # 模拟销售库（SQLite，3 张关联表）
@@ -304,8 +305,9 @@ evals/
 └── reports/             # 评测报告（仅 baseline 入库，临时报告已忽略）
 tests/
 ├── test_smoke.py        # 离线冒烟测试（34 个用例）
-├── test_graph.py        # 状态机与重试测试（9 个用例，全 mock LLM）
-├── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
+├── test_graph.py        # 状态机与重试测试（12 个用例，全 mock LLM）
+├── test_guard.py        # 取值校验与澄清分支测试（7 个用例）
+├── test_ui.py           # 网页界面测试（5 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（22 个用例）
 ├── test_security.py     # 安全防护测试（16 个用例）
 ├── test_deploy.py       # 部署配置测试（9 个用例）
@@ -320,16 +322,26 @@ Dockerfile               # 单镜像部署（含中文字体与健康检查）
 问题 + 历史对话
  ↓
 understand：有历史则改写成完整问题；判定走 SQL 还是 pandas
+           并做取值校验——提到的地区/品类/客户等级库里没有时，先问清再动手
  ↓
+  ├─ 取值对不上 ─→ clarify：说明"库里没有这个值"，列出真实可选值（零 token，不生成）
+  ↓
 generate：生成 SQL 或 pandas 代码（重试时带上一次的真实报错）
  ↓
 execute：SQL 走只读库 / 代码走受限命名空间
  ↓
   ├─ 成功且有数据 ─→ answer：规则选图（Plotly HTML）+ 统计分析 → 中文洞察
+  ├─ 聚合结果为空 ─→ answer：不重试（SUM 返回 NULL 说明条件内确实没数据，
+  │                  放宽会把别的时段/地区的数算进同一指标），直接给事实
   ├─ 成功但 0 行 ─→ reflect：不换路，只提示"放宽条件 / 核对枚举值"重写一次
   │                   → 仍为空则如实说明"没有匹配数据"，不空转、不编结论
   └─ 失败 ────────→ reflect：记录错误、SQL 失败则换 pandas → 回到 generate（最多 2 次）
 ```
+
+**空结果与取值说明为什么值得单独做**：`SELECT SUM(amount)` 在没有匹配行时返回的是
+一行 `NULL` 而不是 0 行，所以"有没有数据"不能只看行数；而模型遇到库里没有的取值
+（比如问"办公用品"）会自己挑个最近的类别（"配件"）给出金额——这类错误不报错、
+不返空，数字看起来完全正常。本项目对前者单独判定、对后者在生成前拦截。
 
 ## 安全说明（重要）
 
@@ -369,12 +381,13 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 145 个用例，覆盖：
+共 155 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
 | `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
-| `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级、空结果自愈与如实说明（全部 mock LLM） |
+| `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级、空结果自愈、聚合空不重试、`COUNT=0` 仍算有效答案（全部 mock LLM） |
+| `tests/test_guard.py` | 取值校验正反例（未知取值必拦、泛指维度与固定搭配绝不误拦）、澄清分支端到端（不调用模型、列出真实可选值） |
 | `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递、追问建议按钮（全部 mock LLM） |
 | `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容） |
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |

@@ -2,10 +2,12 @@
 
 职责：
 1. 多轮记忆：有历史时，把追问改写成不依赖上下文的完整问题（"只看华东" → "华东各品类销售额"）；
-2. 路由判定：有数据库走 Text-to-SQL，否则走 Text-to-Pandas；
-3. 注入对应的 schema 与业务术语。
+2. 取值校验：用户提到的枚举值库里没有时，标记出来交给澄清分支，别让模型硬映射（P0-1b）；
+3. 路由判定：有数据库走 Text-to-SQL，否则走 Text-to-Pandas；
+4. 注入对应的 schema 与业务术语。
 
 省成本设计：**没有历史时不调用 LLM**，直接用原问题——单轮场景不该为改写付 token。
+取值校验也纯规则，不额外调用模型。
 """
 from typing import List
 
@@ -15,6 +17,7 @@ from app.context import AgentContext
 from app.llm import get_llm
 from app.prompts.templates import REWRITE_SYSTEM, REWRITE_USER_TEMPLATE
 from app.state import AgentState
+from app.tools.enum_guard import find_unknown_enum
 
 HISTORY_LIMIT = 6  # 最多带入 6 条历史（约 3 轮）
 
@@ -62,12 +65,16 @@ def make_understand_node(ctx: AgentContext):
         route = "sql" if ctx.has_db else "pandas"
         schema_info = ctx.db_schema if route == "sql" else ctx.df_schema
 
+        # 取值校验：拿**改写后**的问题去比对，多轮追问里的取值也能被拦住
+        unknown = find_unknown_enum(rewritten, ctx.data_profile.get("enums") or [])
+
         return {
             "rewritten_question": rewritten,
             "route": route,
             "schema_info": schema_info,
             "terms": ctx.terms,
             "retry_count": state.get("retry_count", 0),
+            "unknown_enum": unknown,
         }
 
     return node

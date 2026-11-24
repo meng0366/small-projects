@@ -187,17 +187,116 @@ def build_db_schema_text(db_path: str, catalog: dict = None) -> str:
         lines.extend(f"- {r}" for r in relationships)
         lines.append("")
 
-    # 枚举值：SQL 里写死字面量容易出错，单独列出
-    enum_lines = []
-    for table, meta in catalog_tables.items():
-        for col_name, m in (meta.get("columns") or {}).items():
-            if m.get("values"):
-                enum_lines.append(f"- {table}.{col_name}：{' / '.join(m['values'])}")
-    if enum_lines:
-        lines.append("枚举字段取值范围（写 WHERE 时须严格使用以下字面量）：")
-        lines.extend(enum_lines)
+    # 枚举值 + 时间范围用**实测**值（catalog 声明可能已过期）：
+    # 真实试跑里模型会把"办公用品"映射成"配件"，说明只给列表还不够，
+    # 但至少要让列表是库里的真值，并把"哪些时段根本没有数据"明确摆出来。
+    profile = collect_data_profile(db_path, catalog)
+    if profile["enums"]:
+        lines.append("枚举字段取值范围（写 WHERE 时必须严格使用以下字面量，不要用近义词替换）：")
+        for e in profile["enums"]:
+            suffix = "（仅列前 20 个）" if len(e["values"]) >= MAX_ENUM_VALUES else ""
+            lines.append(f"- {e['table']}.{e['column']}：{' / '.join(e['values'])}{suffix}")
+        lines.append("")
+    if profile["date_ranges"]:
+        lines.append("时间覆盖范围（超出该范围的时段确实没有数据，不要用别的时段顶替）：")
+        for d in profile["date_ranges"]:
+            lines.append(f"- {d['table']}.{d['column']}：{d['min']} ~ {d['max']}")
         lines.append("")
 
     lines.append("数据库方言：SQLite。日期字段 order_date 以 'YYYY-MM-DD' 文本形式存储，"
                  "按月分组用 strftime('%Y-%m', order_date)，按年用 strftime('%Y', order_date)。")
     return "\n".join(lines).strip()
+
+
+# ============ 数据画像（P0-1b：空结果判断 + 取值核对） ============
+
+MAX_ENUM_VALUES = 20
+"""单列最多列出的取值个数，防止高基数列（如客户名）把 Prompt 撑爆。"""
+
+
+def _distinct_values(con, table: str, column: str, limit: int = MAX_ENUM_VALUES) -> list:
+    """读某列的真实取值（去重、排序、限量）。失败返回空列表，让调用方回退。"""
+    try:
+        rows = con.execute(
+            f'SELECT DISTINCT "{column}" FROM "{table}" '
+            f'WHERE "{column}" IS NOT NULL ORDER BY "{column}" LIMIT {int(limit)}'
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(r[0]) for r in rows]
+
+
+def collect_data_profile(db_path: str, catalog: dict = None) -> dict:
+    """实测库里"实际有什么"：日期覆盖范围 + 枚举列真实取值。
+
+    为什么不复用 schema：schema 描述的是"表结构长什么样"，而回答"为什么查不到"
+    需要的是事实——真实时间范围、真实取值。catalog 里声明的 values 也可能与库不符。
+    没有这层事实，模型只能猜"是不是条件写错了"，或者把用户说的词映射成近似取值。
+
+    返回结构：
+        {"date_ranges": [{table, column, min, max}],
+         "enums": [{table, column, label, values, hints}]}
+    """
+    catalog = catalog if catalog is not None else load_catalog()
+    catalog_tables = {t.get("name"): t for t in (catalog.get("tables") or [])}
+    profile = {"date_ranges": [], "enums": []}
+    if not db_path or not os.path.exists(db_path):
+        return profile
+
+    con = sqlite3.connect(db_path)
+    try:
+        for table in list_tables(db_path):
+            for col_name, col_type in _table_columns(db_path, table):
+                if "date" not in (col_type or "").lower():
+                    continue
+                try:
+                    mn, mx = con.execute(
+                        f'SELECT MIN("{col_name}"), MAX("{col_name}") FROM "{table}"'
+                    ).fetchone()
+                except sqlite3.Error:
+                    continue
+                if mn and mx:
+                    profile["date_ranges"].append({
+                        "table": table, "column": col_name,
+                        "min": str(mn), "max": str(mx),
+                    })
+
+            col_meta = (catalog_tables.get(table) or {}).get("columns") or {}
+            for col_name in sorted({c for c, m in col_meta.items() if m.get("values")}):
+                m = col_meta.get(col_name) or {}
+                # 以实测为准，实测读不到（列不存在等）才回退到 catalog 声明
+                values = _distinct_values(con, table, col_name) or [
+                    str(v) for v in (m.get("values") or [])]
+                if not values:
+                    continue
+                profile["enums"].append({
+                    "table": table, "column": col_name,
+                    "label": m.get("label", ""),
+                    "values": values,
+                    "hints": [str(h) for h in (m.get("hints") or [])],
+                })
+    finally:
+        con.close()
+    return profile
+
+
+def format_data_profile(profile: dict) -> str:
+    """把数据画像排成 Prompt 可用文本；没有可用事实时返回空串。"""
+    date_ranges = (profile or {}).get("date_ranges") or []
+    enums = (profile or {}).get("enums") or []
+    if not date_ranges and not enums:
+        return ""
+
+    lines = []
+    if date_ranges:
+        lines.append("时间覆盖范围：")
+        lines.extend(
+            f"- {d['table']}.{d['column']}：{d['min']} ~ {d['max']}" for d in date_ranges)
+    if enums:
+        if lines:
+            lines.append("")
+        lines.append("字段实际取值（提问里出现的值必须来自这里）：")
+        for e in enums:
+            suffix = "（仅前 20 个）" if len(e["values"]) >= MAX_ENUM_VALUES else ""
+            lines.append(f"- {e['table']}.{e['column']}：{' / '.join(e['values'])}{suffix}")
+    return "\n".join(lines)
