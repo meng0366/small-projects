@@ -16,7 +16,7 @@
 | 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ✅ |
 | 6 | 命令行增强（子命令 / 子命令输出格式 / 会话续聊 / 追问建议） | ✅ |
-| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ **持续集成（GitHub Actions）** | ✅ |
+| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ 持续集成（GitHub Actions）/ **链路追踪（trace_id）** | ✅ |
 
 ## 环境要求
 
@@ -208,9 +208,34 @@ python -m app.cli logs              # 最近 10 条
 python -m app.cli logs -n 5         # 最近 5 条
 python -m app.cli logs --failed     # 只看失败
 python -m app.cli logs --json       # 机器可读
+python -m app.cli logs --trace 240001  # 看某一次问答的各阶段耗时（完整号 / 前缀 / 尾号都行）
 ```
 
-显示时间、成败、路由、重试次数、结果行数、耗时、token 用量。日志在 `output/logs/agent.jsonl`。
+显示时间、成败、路由、重试次数、结果行数、耗时、token 用量、追踪号。日志在 `output/logs/agent.jsonl`。
+
+### 一次问答的链路：慢在哪、卡在哪
+
+`ask` 的输出末尾会打印追踪号，网页端在回答下方也能看到。用它还原这一次问答的完整过程：
+
+```bash
+python -m app.cli ask "为什么 6 月的销售额比 5 月高？"
+# ... [追踪] 20261124-225725-240001（看这次各阶段耗时：python -m app.cli logs --trace 20261124-225725-240001）
+
+python -m app.cli logs --trace 20261124-225725-240001
+# 阶段          耗时  关键信息
+# understand   33ms  route=sql
+# generate    837ms  statement_len=158
+# execute      13ms  rows=5
+# answer      942ms
+# 汇总：成功 · 5 行 · 2 次模型调用 · tokens 2854/33 · 1.83s
+```
+
+日志里两类行共用一个 `trace_id`：**阶段事件**（每个节点一行，带 `stage`）和末尾的
+**汇总行**（没有 `stage`）。generate 慢说明改写或生成卡住，execute 慢说明 SQL 本身重；
+链里出现两次 `generate → execute` 就是走了重试环。`--trace` 只给尾号 `240001` 也能查到。
+
+只有状态机路线（默认）有分阶段事件，`--linear` 不经过节点，查不到时会明确提示。
+日志只记标量字段，**SQL 全文与结果表不会落盘**。
 
 ### teach / lessons：答错一次，以后都对
 
@@ -305,7 +330,7 @@ app/
 ├── context.py           # 运行时上下文（数据/Schema/术语，惰性加载）
 ├── state.py             # AgentState 状态结构
 ├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
-├── logging_utils.py     # 运行日志与 token 计数（成本监控）
+├── logging_utils.py     # 运行日志、token 计数与 trace_id 链路追踪（阶段事件 + 汇总行）
 ├── agent.py             # 线性编排（--linear 时使用）
 ├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / version）
 ├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
@@ -346,11 +371,12 @@ tests/
 ├── test_scope.py        # 范围守卫测试（13 个用例，含"改年份换出数据"的拒绝）
 ├── test_lesson.py       # 修正回流测试（27 个用例：入库校验、指纹隔离、相关度正反例、注入位置）
 ├── test_attribution.py  # 指标归因测试（25 个用例：语序定基期、跨年歧义、合计行、比率指标、降级）
-├── test_ui.py           # 网页界面测试（7 个用例，全 mock LLM）
+├── test_trace.py        # 链路追踪测试（20 个用例：追踪号唯一性、三级匹配、重试链、异常留痕）
+├── test_ui.py           # 网页界面测试（8 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（34 个用例，含 refuse/clarify）
 ├── test_security.py     # 安全防护测试（16 个用例）
 ├── test_deploy.py       # 部署配置测试（12 个用例，含配置总闸）
-└── test_cli.py          # 命令行与新模块测试（51 个用例，全离线）
+└── test_cli.py          # 命令行与新模块测试（52 个用例，全离线）
 Dockerfile               # 单镜像部署（含中文字体与健康检查）
 .github/workflows/tests.yml  # CI：每次推送跑离线测试并构建镜像（在仓库根，与项目同级）
 .streamlit/config.toml   # 界面主题与服务器配置
@@ -462,7 +488,7 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 238 个用例，覆盖：
+共 260 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -472,11 +498,12 @@ python -m unittest discover -s tests -v
 | `tests/test_scope.py` | 范围守卫：年份/月份/取值被改掉必拦、同月换日期区间不误伤、`DEFER` 与自然语言拒答不执行、改条件换来的数据被丢弃 |
 | `tests/test_lesson.py` | 修正回流：入库校验（非 SELECT / 跑不通 / 超长一律拒）、按库指纹隔离、相关度正反例（口径词命中 vs 区域/取值/年份冲突）、注入位置与开关 |
 | `tests/test_attribution.py` | 指标归因：语序决定基期（`A比B` / `从A到B`）、单时段默认上一期、跨年只取最新年、合计行剔除、单边缺失记 0、比率指标不可加总、拆不出维度时降级、普通问题不误判 |
-| `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、拒答走正文而非告警、多轮改写与历史传递、追问建议按钮（全部 mock LLM） |
+| `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、拒答走正文而非告警、多轮改写与历史传递、追问建议按钮、追踪号展示（全部 mock LLM） |
 | `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容）、refuse/clarify 正反例（给了数就判错） |
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
-| `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、追问建议、退出码 |
+| `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、`logs --trace` 参数、追问建议、退出码 |
+| `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、重试环与澄清分支的链路、节点异常留痕、CLI 链路输出 |
 
 ### 持续集成
 

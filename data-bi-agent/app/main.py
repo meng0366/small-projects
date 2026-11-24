@@ -140,6 +140,7 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
         "suggestions": state.get("suggestions") or [],
+        "trace_id": state.get("trace_id") or "",
     })
 
     # 多轮上下文只保留文字，不带表格（控制 token）
@@ -215,6 +216,12 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
         with st.expander(f"自动重试记录（{msg['retry']} 次）"):
             for err in msg.get("errors") or []:
                 st.caption(f"· {err}")
+
+    # 排查入口：把这次问答的追踪号直接摆出来，可以拿它去日志里看各阶段耗时（P2-2）
+    trace = msg.get("trace_id") or ""
+    if show_code and trace:
+        st.caption(f"追踪号 `{trace}` · 查各阶段耗时："
+                   f"`python -m app.cli logs --trace {trace}`")
 
     # 追问建议：点一下直接接着问，省去自己组织语言（规则生成，不额外耗 token）
     suggestions = msg.get("suggestions") or []

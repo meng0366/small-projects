@@ -19,6 +19,7 @@ class AgentState(TypedDict, total=False):
     # ---- 输入 ----
     question: str                    # 用户当前提问（原文）
     history: List[Message]           # 历史对话（多轮记忆）
+    trace_id: str                    # 本次问答的追踪号（P2-2），把所有阶段日志串成一条链
 
     # ---- 理解阶段 ----
     rewritten_question: str          # 结合上下文改写后的完整问题

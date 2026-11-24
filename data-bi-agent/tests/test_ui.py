@@ -189,6 +189,18 @@ class TestWebUI(unittest.TestCase):
         self.assertEqual(len(at.exception), 0)
         self.assertEqual(asked, ["各区域的销售额是多少？", "各品类的销售额是多少？"])
 
+    def test_trace_id_shown_for_troubleshooting(self):
+        """追踪号要出现在页面上，用户才能拿它去日志里查各阶段耗时（P2-2）。"""
+        at = self._app()
+        state = dict(FAKE_STATE, trace_id="20261124-101010-abcdefef")
+        with mock.patch("app.graph.GraphAgent.run", return_value=state):
+            at.chat_input[0].set_value("各区域的销售额是多少？").run()
+
+        self.assertEqual(len(at.exception), 0)
+        captions = " ".join(c.value for c in at.caption)
+        self.assertIn("20261124-101010-abcdefef", captions)
+        self.assertIn("logs --trace", captions)
+
 
 if __name__ == "__main__":
     unittest.main()

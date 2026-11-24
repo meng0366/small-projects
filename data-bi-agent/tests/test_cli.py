@@ -93,6 +93,13 @@ class TestParser(unittest.TestCase):
         self.assertEqual(args.n, 5)
         self.assertTrue(args.failed)
         self.assertTrue(args.json)
+        self.assertEqual(args.trace, "")
+
+    def test_logs_trace_option(self):
+        """`-t` 与 `--trace` 都要能指定追踪号（P2-2）。"""
+        for flag in ("-t", "--trace"):
+            args = self.parser.parse_args(["logs", flag, "20261124-101010-abcd"])
+            self.assertEqual(args.trace, "20261124-101010-abcd")
 
 
 class TestRender(unittest.TestCase):

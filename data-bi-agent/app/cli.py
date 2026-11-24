@@ -12,6 +12,7 @@
     python -m app.cli chat --list-sessions # 列出本地会话
     python -m app.cli schema               # 看数据源、表结构、字段释义、指标口径
     python -m app.cli logs -n 5 --failed   # 看最近 5 条失败的运行记录
+    python -m app.cli logs --trace 20261124-225251-cb5d   # 看某一次的各阶段耗时
     python -m app.cli teach "问题" --sql "SELECT ..."   # 把答错的问题教成 few-shot
     python -m app.cli lessons              # 查看 / 删除已沉淀的修正记录
 
@@ -36,7 +37,7 @@ from app.agent import DataAgent
 from app.config import LLM_MODEL
 from app.context import AgentContext
 from app.graph import GraphAgent
-from app.logging_utils import log_path, read_runs
+from app.logging_utils import log_path, read_events, read_runs
 from app.render import (
     SUPPORTED_FORMATS,
     UnsupportedFormat,
@@ -131,6 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     logs_cmd = sub.add_parser("logs", aliases=["l"], help="查看运行记录（耗时、token、失败原因）")
     logs_cmd.add_argument("-n", type=int, default=10, metavar="N", help="显示最近 N 条（默认 10）")
     logs_cmd.add_argument("--failed", action="store_true", help="只看失败的记录")
+    logs_cmd.add_argument("-t", "--trace", metavar="ID", default="",
+                          help="显示某次问答的完整阶段链路（支持追踪号前缀）")
     logs_cmd.add_argument("--json", action="store_true", help="以 JSON 输出")
 
     teach = sub.add_parser("teach", aliases=["t"],
@@ -229,6 +232,14 @@ def ask_once(args, question: str) -> dict:
 
 
 # ---------------------------------------------------------------- 输出
+def _print_trace_hint(state: dict) -> None:
+    """追踪号放在最后：只有要排查时才需要它，不该占结论的位置。"""
+    trace = state.get("trace_id") or ""
+    if trace:
+        print(f"\n[追踪] {trace}（看这次各阶段耗时："
+              f"python -m app.cli logs --trace {trace}）")
+
+
 def _print_human(state: dict, question: str, quiet: bool = False) -> None:
     """人类可读输出：过程信息 + 结果表 + 图表 + 洞察 + 追问建议。"""
     rewritten = state.get("rewritten_question") or ""
@@ -250,6 +261,7 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
         print(f"\n{state.get('answer') or '[未能回答]'}")
         for err in (state.get("errors") or [])[-1:]:
             print(f"  · {err}")
+        _print_trace_hint(state)
         return
 
     statement = state.get("statement") or ""
@@ -287,6 +299,8 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
         for item in suggestions:
             print(f"  · {item}")
 
+    _print_trace_hint(state)
+
 
 def _build_payload(state: dict, question: str) -> dict:
     """`-f json` 的结构化输出：脚本里最需要的是语句、数据、指标，而不是排版。"""
@@ -309,6 +323,7 @@ def _build_payload(state: dict, question: str) -> dict:
     return {
         "question": question,
         "rewritten": state.get("rewritten_question") or "",
+        "trace_id": state.get("trace_id") or "",
         "ok": df is not None,
         "route": state.get("route") or "",
         "statement": state.get("statement") or "",
@@ -566,6 +581,10 @@ def run_schema(args) -> int:
 
 
 def run_logs(args) -> int:
+    trace = (getattr(args, "trace", "") or "").strip()
+    if trace:
+        return _show_trace(trace, as_json=getattr(args, "json", False))
+
     rows = read_runs(limit=args.n, failed_only=args.failed)
     if getattr(args, "json", False):
         print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
@@ -577,7 +596,7 @@ def run_logs(args) -> int:
         return EXIT_OK
 
     print(f"{'时间':<20}{'结果':<6}{'路由':<8}{'重试':>4}{'行数':>6}{'耗时':>8}"
-          f"{'tokens(入/出)':>16}  问题")
+          f"{'tokens(入/出)':>16}  {'追踪号':<22}  问题")
     for row in rows:
         tokens = f"{row.get('tokens_in', 0)}/{row.get('tokens_out', 0)}"
         print(f"{str(row.get('ts', '')):<20}"
@@ -586,9 +605,64 @@ def run_logs(args) -> int:
               f"{int(row.get('retries') or 0):>4}"
               f"{int(row.get('rows') or 0):>6}"
               f"{str(row.get('elapsed') or 0) + 's':>8}"
-              f"{tokens:>16}  {str(row.get('question') or '')[:28]}")
+              f"{tokens:>16}  "
+              f"{str(row.get('trace_id') or '-'):<22}  {str(row.get('question') or '')[:28]}")
     failed = sum(1 for row in rows if not row.get("ok"))
     print(f"\n共 {len(rows)} 条，其中失败 {failed} 条。完整日志：{log_path()}")
+    print("看某一次的各阶段耗时：python -m app.cli logs --trace <追踪号>")
+    return EXIT_OK
+
+
+def _show_trace(trace_id: str, as_json: bool = False) -> int:
+    """把一次问答的阶段事件按执行顺序铺开（P2-2）。
+
+    `logs` 表看向的是"历史有哪几次、成没成"，这里回答的是"那一次卡在哪"：
+    understand 慢说明改写/取值校验拖了；execute 慢说明 SQL 本身重；
+    链里出现两次 generate/execute 就是走了重试环。
+    """
+    events = read_events(trace_id)
+    if not events:
+        print(f"没有找到追踪号 {trace_id} 的阶段记录。", file=sys.stderr)
+        print("只有状态机路线（默认）会产生分阶段事件；`--linear` 不经过节点，没有链。",
+              file=sys.stderr)
+        print("看最近几次：python -m app.cli logs", file=sys.stderr)
+        return EXIT_USAGE
+
+    if as_json:
+        print(json.dumps(events, ensure_ascii=False, indent=2, default=str))
+        return EXIT_OK
+
+    print(f"追踪号 {trace_id}（{len(events)} 个阶段）\n")
+    traces = {str(e.get("trace_id", "")) for e in events}
+    if len(traces) > 1:
+        # 子串匹配可能命中多条链，明说比让用户以为"这次问了这么多步"好
+        print(f"注意：这个号码匹配到 {len(traces)} 条链，下面按执行顺序全部列出，"
+              f"每行末尾标注所属追踪号。\n")
+    print(f"{'阶段':<12}{'耗时':>8}  关键信息")
+    total = 0
+    for event in events:
+        ms = int(event.get("ms") or 0)
+        total += ms
+        extra = " · ".join(
+            f"{k}={v}" for k, v in event.items()
+            if k not in ("ts", "trace_id", "stage", "ms")
+        )
+        if len(traces) > 1:
+            extra = f"{extra} · 追踪号={event.get('trace_id')}" if extra else \
+                    f"追踪号={event.get('trace_id')}"
+        print(f"{str(event.get('stage', '')):<12}{str(ms) + 'ms':>8}  {extra or '—'}")
+    print(f"\n阶段合计 {total}ms（不含排队与未包装的部分）")
+
+    summary = next((r for r in read_runs(limit=0)
+                    if r.get("trace_id") == trace_id), None)
+    if summary:
+        print(f"汇总：{'成功' if summary.get('ok') else '失败'} · "
+              f"{int(summary.get('rows') or 0)} 行 · "
+              f"{int(summary.get('llm_calls') or 0)} 次模型调用 · "
+              f"tokens {summary.get('tokens_in', 0)}/{summary.get('tokens_out', 0)} · "
+              f"{summary.get('elapsed')}s")
+        if summary.get("error"):
+            print(f"错误：{summary['error']}")
     return EXIT_OK
 
 

@@ -13,6 +13,10 @@
 
 与线性编排（app/agent.py）的关系：两者共用 AgentContext 与全部节点实现，
 状态机多了条件边与重试环；CLI 默认用状态机，`--linear` 可切回线性版对比。
+
+追踪（P2-2）：每个节点经 `_traced()` 包装，执行完写一行阶段事件；
+同一次问答的所有事件与末尾的汇总行共用一个 `trace_id`，`cli logs --trace <id>` 可还原链路。
+包装器不改节点代码，节点以后增删都不用想着"记得补日志"。
 """
 from typing import Optional
 
@@ -23,7 +27,7 @@ from langgraph.graph import END, START, StateGraph
 from app.agent import to_frame
 from app.config import MAX_QUESTION_CHARS
 from app.context import AgentContext
-from app.logging_utils import TokenCounter, log_run
+from app.logging_utils import TokenCounter, log_event, log_run, new_trace_id
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_attribution_sql, generate_code, generate_sql
@@ -323,18 +327,79 @@ def route_after_understand(state: AgentState) -> str:
     return "clarify" if state.get("unknown_enum") else "generate"
 
 
+# ---------------------------------------------------------------- 链路追踪（P2-2）
+#
+# 汇总行只说"最后怎么样"，看不出"慢在哪一步、重试发生在哪、错在哪一层"。
+# 这里给每个节点包一层：执行完补一行阶段事件，全部共用同一个 trace_id。
+# 用白名单挑字段 —— 绝不能把结果表或 SQL 全文写进日志（日志会被翻、会被分享）。
+
+_TRACE_FIELDS = (
+    # (状态里的键, 日志字段名, 取值转换)
+    ("route", "route", str),
+    ("retry_count", "retry", int),
+    ("statement", "statement_len", lambda v: len(str(v or ""))),
+    ("result", "rows", lambda v: 0 if v is None else len(v)),
+    ("error", "error", lambda v: str(v or "")[:200]),
+    ("unknown_enum", "clarify", bool),
+    ("defer", "defer", bool),
+    ("scope_violation", "scope_violation", bool),
+    ("attribution", "attribution", lambda v: bool((v or {}).get("ok"))),
+    ("chart_type", "chart", str),
+    ("lessons_used", "lessons", len),
+    ("errors", "errors", len),
+)
+
+
+def _trace_fields(update: dict) -> dict:
+    """只挑本次节点真正写过的键；0 / False / 空串这类"没发生"的值不写。"""
+    fields = {}
+    for key, name, cast in _TRACE_FIELDS:
+        if key not in update:
+            continue
+        try:
+            value = cast(update.get(key))
+        except Exception:
+            continue
+        if value in (0, False, "", None) and name != "rows":
+            continue          # rows=0 是有意义的（查不到数据），其余零值只是噪音
+        fields[name] = value
+    return fields
+
+
+def _traced(name: str, node):
+    """节点包装器：记耗时与关键字段；节点抛异常也要留痕，否则链会缺一段。"""
+
+    def wrapped(state: AgentState) -> dict:
+        started = time.perf_counter()
+        trace_id = (state or {}).get("trace_id", "")
+        try:
+            update = node(state) or {}
+        except Exception as e:
+            log_event(trace_id, name,
+                      ms=round((time.perf_counter() - started) * 1000),
+                      failed=True, error=f"{type(e).__name__}: {e}"[:200])
+            raise
+        log_event(trace_id, name,
+                  ms=round((time.perf_counter() - started) * 1000),
+                  **_trace_fields(update))
+        return update
+
+    return wrapped
+
+
 def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
                 with_insight: bool = True, max_retries: int = DEFAULT_MAX_RETRIES):
     """编译状态机，返回可直接 invoke 的 graph。"""
     ctx = ctx or AgentContext()
 
     builder = StateGraph(AgentState)
-    builder.add_node("understand", make_understand_node(ctx))
-    builder.add_node("clarify", make_clarify_node(ctx))
-    builder.add_node("generate", make_generate_node(ctx))
-    builder.add_node("execute", make_execute_node(ctx))
-    builder.add_node("reflect", make_reflect_node(ctx))
-    builder.add_node("answer", make_answer_node(ctx, with_chart, with_insight))
+    builder.add_node("understand", _traced("understand", make_understand_node(ctx)))
+    builder.add_node("clarify", _traced("clarify", make_clarify_node(ctx)))
+    builder.add_node("generate", _traced("generate", make_generate_node(ctx)))
+    builder.add_node("execute", _traced("execute", make_execute_node(ctx)))
+    builder.add_node("reflect", _traced("reflect", make_reflect_node(ctx)))
+    builder.add_node("answer", _traced("answer",
+                                      make_answer_node(ctx, with_chart, with_insight)))
 
     builder.add_edge(START, "understand")
     builder.add_conditional_edges(
@@ -377,11 +442,14 @@ class GraphAgent:
         if truncated:
             raw_question = raw_question[:MAX_QUESTION_CHARS]
 
+        # 每次问答一个追踪号：阶段事件与汇总行都挂着它（P2-2）
+        trace_id = new_trace_id()
         initial: AgentState = {
             "question": raw_question,
             "history": history or [],
             "retry_count": 0,
             "max_retries": self.max_retries,
+            "trace_id": trace_id,
         }
 
         # 自动挂一个 token 计数器：成本监控写进日志，调用方也可再传自己的回调
@@ -396,6 +464,7 @@ class GraphAgent:
             state = self.graph.invoke(initial, config=merged_config)
         except Exception as e:
             log_run(ok=False, route="", retries=0, rows=0, chart="",
+                    trace_id=trace_id,
                     elapsed=round(time.perf_counter() - started, 2),
                     question=raw_question[:200], question_len=len(raw_question),
                     truncated=truncated, error=f"{type(e).__name__}: {e}",
@@ -432,6 +501,7 @@ class GraphAgent:
 
         log_run(
             ok=result is not None or bool(unknown) or bool(state.get("defer")),
+            trace_id=trace_id,
             clarify=bool(unknown),
             defer=bool(state.get("defer")),
             attribution=bool((state.get("attribution") or {}).get("ok")),
