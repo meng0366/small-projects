@@ -35,3 +35,6 @@ output/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ============ 评测：临时报告不入库，只保留手写的基线 ============
+evals/reports/eval-*

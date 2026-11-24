@@ -1,0 +1,310 @@
+# 评测集（对应 S5.1）——问题 + 金标准 SQL + 判分方式
+#
+# 为什么用"金标准 SQL"而不是人工写死答案：
+#   1. 数据是模拟生成的，但评测逻辑与真实业务一致：标准答案由同一份库算出来，不会抄错；
+#   2. 数据换了（换成真实业务库）只要改 gold_sql 里的表名，评测集结构不用动；
+#   3. 判分只比"值"，不比列名和列顺序，模型给中文别名不影响对错。
+#
+# 字段说明：
+#   mode        scalar（单值汇总，要求 1 行）/ text（答案是某个维度值）/ table（多行结果）
+#   gold_sql    金标准 SQL，在本项目的只读库上执行得到期望结果
+#   alt_sql     可选，等价口径（例如占比用小数还是百分比），命中任意一个即算对
+#   allow_multi_row / allow_extra_cols  放宽行数、列数限制，默认都关闭
+#   atol        数值容差，默认 0.011（覆盖两位小数的浮点误差）；比率类可调小
+
+meta:
+  dataset: data/sales.db
+  description: 2025 全年模拟销售数据，3,877 笔订单、20 个客户、20 个商品
+
+cases:
+  # ============ A 总量指标 ============
+  - id: A01
+    category: 总量指标
+    question: 2025 年的总销售额是多少？
+    gold_sql: "SELECT ROUND(SUM(amount), 2) AS 总销售额 FROM orders"
+    mode: scalar
+
+  - id: A02
+    category: 总量指标
+    question: 一共有多少笔订单？
+    gold_sql: "SELECT COUNT(*) AS 订单量 FROM orders"
+    mode: scalar
+
+  - id: A03
+    category: 总量指标
+    question: 全部商品一共卖出了多少件？
+    gold_sql: "SELECT SUM(quantity) AS 销量 FROM orders"
+    mode: scalar
+
+  - id: A04
+    category: 总量指标
+    question: 平均每笔订单的金额是多少？
+    gold_sql: "SELECT ROUND(AVG(amount), 2) AS 平均订单金额 FROM orders"
+    mode: scalar
+
+  - id: A05
+    category: 总量指标
+    question: 有多少个客户下过单？
+    gold_sql: "SELECT COUNT(DISTINCT customer_id) AS 下单客户数 FROM orders"
+    mode: scalar
+
+  # ============ B 维度汇总 ============
+  - id: B01
+    category: 维度汇总
+    question: 各区域的销售额分别是多少？
+    gold_sql: "SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
+    mode: table
+
+  - id: B02
+    category: 维度汇总
+    question: 各品类的销售额分别是多少？
+    gold_sql: "SELECT p.category AS 品类, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category"
+    mode: table
+
+  - id: B03
+    category: 维度汇总
+    question: 不同客户等级的销售额分别是多少？
+    gold_sql: "SELECT c.customer_level AS 客户等级, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.customer_level"
+    mode: table
+
+  - id: B04
+    category: 维度汇总
+    question: 每个月的销售额分别是多少？月份用 YYYY-MM 格式表示。
+    gold_sql: "SELECT strftime('%Y-%m', order_date) AS 月份, ROUND(SUM(amount), 2) AS 销售额 FROM orders GROUP BY 月份"
+    mode: table
+
+  - id: B05
+    category: 维度汇总
+    question: 各区域的订单量分别是多少？
+    gold_sql: "SELECT c.region AS 区域, COUNT(*) AS 订单量 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
+    mode: table
+
+  - id: B06
+    category: 维度汇总
+    question: 各品类的销量分别是多少件？
+    gold_sql: "SELECT p.category AS 品类, SUM(o.quantity) AS 销量 FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category"
+    mode: table
+
+  - id: B07
+    category: 维度汇总
+    question: 各区域的客单价是多少？客单价按销售额除以订单量计算。
+    gold_sql: "SELECT c.region AS 区域, ROUND(SUM(o.amount) / COUNT(*), 2) AS 客单价 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
+    mode: table
+
+  # ============ C 排名 ============
+  - id: C01
+    category: 排名 Top-N
+    question: 销售额最高的 5 个商品是哪些？
+    gold_sql: "SELECT p.product_name AS 商品, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.product_name ORDER BY 销售额 DESC LIMIT 5"
+    mode: table
+
+  - id: C02
+    category: 排名 Top-N
+    question: 销售额最高的 3 个客户是谁？
+    # 注意：模拟数据里客户名可能重名（东莞科技有 3 个不同客户），
+    # "客户"必须按 customer_id 区分，不能按名称分组合并。
+    gold_sql: "SELECT c.customer_name AS 客户, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.customer_id ORDER BY SUM(o.amount) DESC LIMIT 3"
+    mode: table
+
+  - id: C03
+    category: 排名 Top-N
+    question: 销售额最高的品类是哪个？
+    gold_sql: "SELECT p.category FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category ORDER BY SUM(o.amount) DESC LIMIT 1"
+    mode: text
+
+  - id: C04
+    category: 排名 Top-N
+    question: 销售额最高的区域是哪个？
+    gold_sql: "SELECT c.region FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region ORDER BY SUM(o.amount) DESC LIMIT 1"
+    mode: text
+
+  - id: C05
+    category: 排名 Top-N
+    question: 订单量最多的客户是谁？
+    gold_sql: "SELECT c.customer_name FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.customer_id ORDER BY COUNT(*) DESC LIMIT 1"
+    mode: text
+
+  # ============ D 条件筛选 ============
+  - id: D01
+    category: 条件筛选
+    question: 华东区域的销售额是多少？
+    gold_sql: "SELECT ROUND(SUM(o.amount), 2) FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '华东'"
+    mode: scalar
+
+  - id: D02
+    category: 条件筛选
+    question: 手机品类一共卖出了多少件？
+    gold_sql: "SELECT SUM(o.quantity) FROM orders o JOIN products p ON o.product_id = p.product_id WHERE p.category = '手机'"
+    mode: scalar
+
+  - id: D03
+    category: 条件筛选
+    question: 战略客户贡献了多少销售额？
+    gold_sql: "SELECT ROUND(SUM(o.amount), 2) FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.customer_level = '战略客户'"
+    mode: scalar
+
+  - id: D04
+    category: 条件筛选
+    question: 2025 年 6 月的销售额是多少？
+    gold_sql: "SELECT ROUND(SUM(amount), 2) FROM orders WHERE strftime('%Y-%m', order_date) = '2025-06'"
+    mode: scalar
+
+  - id: D05
+    category: 条件筛选
+    question: 2025 年第四季度（10 月到 12 月）的销售额是多少？
+    gold_sql: "SELECT ROUND(SUM(amount), 2) FROM orders WHERE order_date >= '2025-10-01' AND order_date <= '2025-12-31'"
+    mode: scalar
+
+  - id: D06
+    category: 条件筛选
+    question: 华北区域的订单量是多少？
+    gold_sql: "SELECT COUNT(*) FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '华北'"
+    mode: scalar
+
+  # ============ E 业务口径 / 占比 ============
+  - id: E01
+    category: 业务口径
+    question: 有折扣的订单（折扣小于 1）占全部订单的比例是多少？用百分比表示，保留 2 位小数。
+    gold_sql: "SELECT ROUND(100.0 * SUM(CASE WHEN discount < 1 THEN 1 ELSE 0 END) / COUNT(*), 2) FROM orders"
+    alt_sql:
+      - "SELECT ROUND(1.0 * SUM(CASE WHEN discount < 1 THEN 1 ELSE 0 END) / COUNT(*), 4) FROM orders"
+    mode: scalar
+
+  - id: E02
+    category: 业务口径
+    question: 第四季度的销售额占全年的比重是多少？用百分比表示，保留 2 位小数。
+    gold_sql: "SELECT ROUND(100.0 * SUM(CASE WHEN order_date >= '2025-10-01' AND order_date <= '2025-12-31' THEN amount ELSE 0 END) / SUM(amount), 2) FROM orders"
+    alt_sql:
+      - "SELECT ROUND(1.0 * SUM(CASE WHEN order_date >= '2025-10-01' AND order_date <= '2025-12-31' THEN amount ELSE 0 END) / SUM(amount), 4) FROM orders"
+    mode: scalar
+
+  - id: E03
+    category: 业务口径
+    question: 华东区域各品类的销售额分别是多少？
+    gold_sql: "SELECT p.category AS 品类, ROUND(SUM(o.amount), 2) AS 销售额 FROM orders o JOIN customers c ON o.customer_id = c.customer_id JOIN products p ON o.product_id = p.product_id WHERE c.region = '华东' GROUP BY p.category"
+    mode: table
+
+  - id: E04
+    category: 业务口径
+    question: 各区域有折扣订单的占比分别是多少？用百分比数值表示，保留 2 位小数。
+    gold_sql: "SELECT c.region AS 区域, ROUND(100.0 * SUM(CASE WHEN o.discount < 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS 折扣订单占比 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
+    mode: table
+
+  # ============ F 时间趋势 ============
+  - id: F01
+    category: 时间趋势
+    question: 2025 年上半年每个月的订单量分别是多少？月份用 YYYY-MM 格式表示。
+    gold_sql: "SELECT strftime('%Y-%m', order_date) AS 月份, COUNT(*) AS 订单量 FROM orders WHERE order_date < '2025-07-01' GROUP BY 月份"
+    mode: table
+
+  - id: F02
+    category: 时间趋势
+    question: 哪个月的销售额最高？
+    gold_sql: "SELECT strftime('%Y-%m', order_date) FROM orders GROUP BY strftime('%Y-%m', order_date) ORDER BY SUM(amount) DESC LIMIT 1"
+    mode: text
+
+  - id: F03
+    category: 时间趋势
+    question: 平均每笔订单购买了多少件商品？保留 2 位小数。
+    gold_sql: "SELECT ROUND(AVG(quantity), 2) FROM orders"
+    mode: scalar
+
+  # ============ H 复杂推理（多步计算，区分度更高）============
+  - id: H01
+    category: 复杂推理
+    question: 2025 年 6 月的销售额比 5 月增长了百分之多少？保留 2 位小数。
+    gold_sql: "SELECT ROUND(100.0 * (SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-06' THEN amount END) - SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-05' THEN amount END)) / SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-05' THEN amount END), 2) FROM orders"
+    alt_sql:
+      - "SELECT ROUND((SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-06' THEN amount END) - SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-05' THEN amount END)) / SUM(CASE WHEN strftime('%Y-%m', order_date) = '2025-05' THEN amount END), 4) FROM orders"
+    mode: scalar
+
+  - id: H02
+    category: 复杂推理
+    question: 西南区域的战略客户在 2025 年下半年的销售额是多少？
+    gold_sql: "SELECT ROUND(SUM(o.amount), 2) FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '西南' AND c.customer_level = '战略客户' AND o.order_date >= '2025-07-01'"
+    mode: scalar
+
+  - id: H03
+    category: 复杂推理
+    question: 下单次数达到 200 次及以上的客户有多少个？
+    gold_sql: "SELECT COUNT(*) FROM (SELECT customer_id FROM orders GROUP BY customer_id HAVING COUNT(*) >= 200)"
+    mode: scalar
+
+  - id: H04
+    category: 复杂推理
+    question: 每个品类里销量最高的商品分别是什么？
+    gold_sql: "WITH t AS (SELECT p.category AS cat, p.product_name AS pn, SUM(o.quantity) AS q FROM orders o JOIN products p ON o.product_id = p.product_id GROUP BY p.category, p.product_id), rk AS (SELECT cat, pn, ROW_NUMBER() OVER (PARTITION BY cat ORDER BY q DESC) AS rn FROM t) SELECT cat, pn FROM rk WHERE rn = 1"
+    mode: table
+    # 多返回一列"销量"作为佐证是合理的，题面只问"是什么"
+    allow_extra_cols: true
+
+  - id: H05
+    category: 复杂推理
+    question: 销售额最高的客户位于哪个区域？
+    gold_sql: "SELECT c.region FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.customer_id ORDER BY SUM(o.amount) DESC LIMIT 1"
+    mode: text
+
+  - id: H06
+    category: 复杂推理
+    question: 周末（周六、周日）和工作日的销售额分别是多少？
+    gold_sql: "SELECT CASE WHEN strftime('%w', order_date) IN ('0', '6') THEN '周末' ELSE '工作日' END AS 类型, ROUND(SUM(amount), 2) AS 销售额 FROM orders GROUP BY 1"
+    mode: table
+
+  - id: H07
+    category: 复杂推理
+    question: 各客户等级的销量分别是多少件？
+    gold_sql: "SELECT c.customer_level AS 客户等级, SUM(o.quantity) AS 销量 FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.customer_level"
+    mode: table
+
+  - id: H08
+    category: 复杂推理
+    question: 销售额排在第二位的区域是哪个？
+    gold_sql: "SELECT c.region FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region ORDER BY SUM(o.amount) DESC LIMIT 1 OFFSET 1"
+    mode: text
+
+  # ============ G 多轮追问（考察上下文改写）============
+  - id: G01
+    category: 多轮追问
+    question: 只看华东的
+    history:
+      - role: user
+        content: 各区域的销售额是多少？
+      - role: assistant
+        content: 已按区域汇总 2025 年销售额，包含华东、华南、华北、西南、华中五个区域。
+    gold_sql: "SELECT ROUND(SUM(o.amount), 2) FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '华东'"
+    mode: scalar
+
+  - id: G02
+    category: 多轮追问
+    question: 那手机的呢？
+    history:
+      - role: user
+        content: 各品类的销售额是多少？
+      - role: assistant
+        content: 已按品类汇总销售额，品类包括手机、笔记本、平板、配件、智能家居。
+    gold_sql: "SELECT ROUND(SUM(o.amount), 2) FROM orders o JOIN products p ON o.product_id = p.product_id WHERE p.category = '手机'"
+    mode: scalar
+
+  - id: G03
+    category: 多轮追问
+    question: 销售额最高那个区域的销售额是多少？
+    history:
+      - role: user
+        content: 各区域的销售额是多少？
+      - role: assistant
+        content: 已按区域汇总 2025 年销售额，包含华东、华南、华北、西南、华中五个区域。
+    gold_sql: "SELECT ROUND(MAX(s), 2) FROM (SELECT SUM(o.amount) AS s FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region)"
+    mode: scalar
+
+  # ============ I 口语表达（真实用户不会说得那么书面）============
+  - id: I01
+    category: 口语表达
+    question: 哪个片区卖得最好？
+    gold_sql: "SELECT c.region FROM orders o JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region ORDER BY SUM(o.amount) DESC LIMIT 1"
+    mode: text
+
+  - id: I02
+    category: 口语表达
+    question: 华南那边哪个客户买得最多？
+    gold_sql: "SELECT c.customer_name FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '华南' GROUP BY c.customer_id ORDER BY SUM(o.amount) DESC LIMIT 1"
+    mode: text
