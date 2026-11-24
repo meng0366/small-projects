@@ -14,6 +14,7 @@
 | 3 | LangGraph 编排 + 错误自愈 + 多轮记忆 | ✅ |
 | 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ✅ |
+| 6 | 命令行增强（子命令 / 子命令输出格式 / 会话续聊 / 追问建议） | ✅ |
 
 ## 环境要求
 
@@ -97,22 +98,15 @@ python data/generate_mock_data.py
 ### 7. 开始提问
 
 ```bash
-# 交互模式
+# 交互模式（默认；输入 q 退出）
 python -m app.cli
 
 # 单次提问
 python -m app.cli "各区域的销售额是多少？"
+
+# 也可以用子命令写法（两者等价）
+python -m app.cli ask "各区域的销售额是多少？"
 ```
-
-可选参数：
-
-| 参数 | 作用 |
-| --- | --- |
-| `--linear` | 使用线性编排（无重试、无多轮记忆），默认走 LangGraph 状态机 |
-| `--pandas` | 仅线性模式可用：强制走单表 pandas 模式 |
-| `--no-chart` | 不生成图表 |
-| `--no-insight` | 不生成洞察文案（省一次模型调用） |
-| `--quiet` | 不打印生成的 SQL / 代码 |
 
 > 请在**项目根目录**下执行以上命令。
 > 图表输出到 `output/`，为独立 HTML，双击即可在浏览器查看。
@@ -128,6 +122,113 @@ python -m app.cli "各区域的销售额是多少？"
 > 只看华东
 [改写] 华东区域的销售额是多少？
 （自动加上 WHERE c.region = '华东'）
+```
+
+会话会自动保存，退出后可以接着聊（见下一节）。
+
+## 命令行进阶用法（子命令）
+
+> 2026-11-24 新增。设计参考 natural-sql / nlsql / simonw-llm 三个开源 CLI 的做法，
+> 详见 `docs/参考项目记录.md`（该文档不上传仓库）。
+
+四个子命令：`ask`、`chat`、`schema`、`logs`（外加 `version`），都用 `python -m app.cli` 调用。
+
+### ask：一次提问，可导出
+
+```bash
+# 默认表格输出（带路由、生成的 SQL、洞察、追问建议）
+python -m app.cli ask "各品类的销售额是多少？"
+
+# 结构化输出，脚本里直接用
+python -m app.cli ask "各区域的销售额是多少？" -f json
+
+# 导出到文件（按扩展名识别格式）
+python -m app.cli ask "各品类的销售额是多少？" -o 品类销售额.xlsx
+python -m app.cli ask "各区域的销售额是多少？" -o 区域.csv
+
+# 管道：问题从标准输入读，结果直接进文件
+echo "各区域的销售额是多少？" | python -m app.cli ask - -f csv > 区域.csv
+```
+
+输出格式：`-f table`（默认，给人看）/ `markdown`（贴文档）/ `csv`（喂 Excel、透视表）/ `json`（喂脚本）。
+**只有 `table` 带过程信息**，其余三种的标准输出就是纯数据，提示信息走 stderr，所以重定向不会脏。
+
+`json` 长这样（节选）：
+
+```json
+{
+  "question": "各区域的销售额是多少？",
+  "ok": true,
+  "route": "sql",
+  "statement": "SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 ...",
+  "columns": ["区域", "销售额"],
+  "rows": 5,
+  "data": [{"区域": "华南", "销售额": 5064245.4}],
+  "insight": "华南销售额最高……",
+  "suggestions": ["只看「华南」的情况如何？", "各品类的销售额是多少？", "每个月的销售额走势如何？"],
+  "elapsed": 1.2
+}
+```
+
+### chat：交互会话，可续聊
+
+```bash
+python -m app.cli chat                  # 新会话
+python -m app.cli chat -c               # 接着上一次会话继续问
+python -m app.cli chat --session 销售复盘  # 指定会话名（存在则续上）
+python -m app.cli chat --list-sessions  # 列出本地会话
+```
+
+会话存在 `~/.data-agent/sessions/*.json`（可用环境变量 `AGENT_HOME` 改根目录），
+只存问答文字、不存结果表。交互中还支持斜杠命令：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 帮助 |
+| `/schema` | 查看数据源与表结构 |
+| `/logs` | 最近 5 条运行记录 |
+| `/clear` | 清空上下文，开始新会话 |
+| `/quit` | 退出（也可直接输入 `q`） |
+
+### schema：这个库里有什么
+
+```bash
+python -m app.cli schema          # 表、行数、字段中文释义、表关系、指标口径
+python -m app.cli schema --json   # 机器可读
+```
+
+回答"这个库有哪些表、销售额怎么算"这类问题不用花模型调用。
+
+### logs：跑过什么、慢在哪
+
+```bash
+python -m app.cli logs              # 最近 10 条
+python -m app.cli logs -n 5         # 最近 5 条
+python -m app.cli logs --failed     # 只看失败
+python -m app.cli logs --json       # 机器可读
+```
+
+显示时间、成败、路由、重试次数、结果行数、耗时、token 用量。日志在 `output/logs/agent.jsonl`。
+
+### 公共参数
+
+| 参数 | 作用 | 适用 |
+| --- | --- | --- |
+| `--db PATH` | 换一个 SQLite 库文件（默认 `data/sales.db`）；路径不存在直接报错退出 | ask / chat / schema |
+| `--no-chart` | 不生成图表 | ask / chat |
+| `--no-insight` | 不生成洞察文案（省一次模型调用） | ask / chat |
+| `--linear` | 用线性编排（无重试、无多轮记忆），便于对比 | ask / chat |
+| `--pandas` | 仅线性模式：强制走单表 pandas | ask / chat |
+| `-q, --quiet` | 不打印生成的 SQL / 代码 | ask |
+
+**退出码**：`0` 成功 · `1` 分析失败 · `2` 参数或数据源错误，可直接用在 shell 脚本里：
+
+```bash
+if python -m app.cli ask "各区域销售额" -f json -q > out.json; then
+  echo "成功"
+else
+  echo "失败，看 logs: python -m app.cli logs --failed"
+fi
 ```
 
 ## 网页界面（Streamlit）
@@ -146,7 +247,7 @@ streamlit run app/main.py
 | --- | --- |
 | 左侧栏 | 数据源概览（表名 + 行数）、可展开查看随问题发给模型的 Schema、图表/洞察开关、6 个示例问题、清空对话 |
 | 对话区 | 一问一答，保留多轮上下文，支持「只看华东」这类追问 |
-| 结果区 | 中文洞察结论、结果表格（可下载 CSV）、交互式图表（折线/柱状/饼图/散点）、可展开查看生成的 SQL 或 Python |
+| 结果区 | 中文洞察结论、结果表格（可下载 CSV）、交互式图表（折线/柱状/饼图/散点）、可展开查看生成的 SQL 或 Python、**追问建议按钮**（点一下接着问） |
 | 异常处理 | 分析失败时给出错误摘要与重试记录，页面不崩 |
 
 > 网页与命令行共用同一套状态机，行为一致；界面侧只负责渲染，不重复业务逻辑。
@@ -173,7 +274,9 @@ app/
 ├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
 ├── logging_utils.py     # 运行日志与 token 计数（成本监控）
 ├── agent.py             # 线性编排（--linear 时使用）
-├── cli.py               # 命令行入口
+├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / version）
+├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
+├── sessions.py          # 会话持久化（~/.data-agent/sessions，支持 chat -c 续聊）
 ├── main.py              # Streamlit 网页界面（聊天式问答）
 ├── schema/
 │   ├── loader.py        # 数据加载 / Schema 描述（DataFrame 版 + 数据库版）
@@ -188,6 +291,7 @@ app/
 └── tools/
     ├── sql_tool.py      # SQL 安全校验与只读执行（含查询超时）
     ├── chart_tool.py    # 规则式自动选图（Plotly）
+    ├── suggest_tool.py  # 追问建议（规则式，零 token）
     └── pandas_tool.py   # 预留
 data/
 ├── sales.db             # 模拟销售库（SQLite，3 张关联表）
@@ -203,7 +307,9 @@ tests/
 ├── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
 ├── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（22 个用例）
-└── test_security.py     # 安全防护测试（16 个用例）
+├── test_security.py     # 安全防护测试（16 个用例）
+├── test_deploy.py       # 部署配置测试（9 个用例）
+└── test_cli.py          # 命令行与新模块测试（50 个用例，全离线）
 Dockerfile               # 单镜像部署（含中文字体与健康检查）
 .streamlit/config.toml   # 界面主题与服务器配置
 ```
@@ -261,16 +367,17 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 90 个用例，覆盖：
+共 141 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
 | `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
 | `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级（全部 mock LLM） |
-| `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递（全部 mock LLM） |
+| `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递、追问建议按钮（全部 mock LLM） |
 | `tests/test_eval.py` | 评测集自洽性（金标准 SQL 全部可执行）、判分器正反例（含列顺序无关与量纲宽容） |
 | `tests/test_security.py` | AST 逃逸拦截、执行超时、结果截断、SQL 查询超时、日志落盘 |
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、容器文件与忽略规则、Streamlit 配置解析 |
+| `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、追问建议、退出码 |
 
 ## 评测
 
@@ -358,11 +465,13 @@ streamlit run app/main.py
 
 ## 设计参考
 
-借鉴了 OpenChatBI、PandasAI、WrenAI 三个开源项目的工程实践（**未复制任何代码**，仅借鉴架构思路）：
+借鉴了以下开源项目的工程实践（**未复制任何代码**，仅借鉴架构与交互设计）：
 
 - **校验前置**（OpenChatBI）：生成的代码先做静态校验，通过后才执行
 - **只发 Schema 不发全表**（PandasAI）：更省 token，原始数据不出本地
 - **指标口径语义层**（WrenAI / OpenChatBI）：把「客单价 = 销售额 / 订单数」这类口径写进 `app/schema/catalog.yaml`，避免模型自行发挥
+- **命令行形态**（natural-sql / nlsql / simonw-llm）：子命令结构、`--format` 多格式输出、
+  `chat -c` 续聊、`logs` 查询运行记录、stdin 管道、语义化退出码
 
 ## 版本管理
 
