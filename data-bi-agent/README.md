@@ -12,7 +12,7 @@
 | 1 | 单表问答（Text-to-Pandas，命令行） | ✅ |
 | 2 | 多表 SQL + 图表 + 洞察 | ✅ |
 | 3 | LangGraph 编排 + 错误自愈 + 多轮记忆 | ✅ |
-| 4 | Streamlit 界面 | ⬜ 计划中 |
+| 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ⬜ 计划中 |
 
 ## 环境要求
@@ -130,6 +130,27 @@ python -m app.cli "各区域的销售额是多少？"
 （自动加上 WHERE c.region = '华东'）
 ```
 
+## 网页界面（Streamlit）
+
+命令行之外还提供一个聊天式网页界面，适合演示或给非技术同事使用：
+
+```bash
+streamlit run app/main.py
+```
+
+浏览器会自动打开 <http://localhost:8501>（未自动打开时手动访问）。
+
+界面能力：
+
+| 区域 | 内容 |
+| --- | --- |
+| 左侧栏 | 数据源概览（表名 + 行数）、可展开查看随问题发给模型的 Schema、图表/洞察开关、6 个示例问题、清空对话 |
+| 对话区 | 一问一答，保留多轮上下文，支持「只看华东」这类追问 |
+| 结果区 | 中文洞察结论、结果表格（可下载 CSV）、交互式图表（折线/柱状/饼图/散点）、可展开查看生成的 SQL 或 Python |
+| 异常处理 | 分析失败时给出错误摘要与重试记录，页面不崩 |
+
+> 网页与命令行共用同一套状态机，行为一致；界面侧只负责渲染，不重复业务逻辑。
+
 ## 示例问题
 
 单表（pandas 路径）与多表（SQL 路径）都能回答：
@@ -152,7 +173,7 @@ app/
 ├── graph.py             # LangGraph 状态机（含重试环）
 ├── agent.py             # 线性编排（--linear 时使用）
 ├── cli.py               # 命令行入口
-├── main.py              # Streamlit 界面（阶段 4）
+├── main.py              # Streamlit 网页界面（聊天式问答）
 ├── schema/
 │   ├── loader.py        # 数据加载 / Schema 描述（DataFrame 版 + 数据库版）
 │   └── catalog.yaml     # 业务语义词典（字段含义、指标口径、枚举值）
@@ -173,7 +194,8 @@ data/
 └── generate_mock_data.py # 模拟数据生成脚本
 tests/
 ├── test_smoke.py        # 离线冒烟测试（34 个用例）
-└── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
+├── test_graph.py        # 状态机与重试测试（5 个用例，全 mock LLM）
+└── test_ui.py           # 网页界面测试（4 个用例，全 mock LLM）
 ```
 
 ## 工作流程
@@ -207,12 +229,13 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 39 个用例，覆盖：
+共 43 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
 | `tests/test_smoke.py` | 代码安全检查、SQL 注入与绕过拦截、Schema 生成、选图规则、结果压缩、上下文加载 |
 | `tests/test_graph.py` | 状态机正常路径、SQL 失败换 pandas、错误回喂、重试耗尽、无数据库降级（全部 mock LLM） |
+| `tests/test_ui.py` | 界面首屏渲染、问答结果渲染（表格/图表/下载）、失败告警、多轮改写与历史传递（全部 mock LLM） |
 
 ## 设计参考
 
