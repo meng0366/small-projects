@@ -5,10 +5,17 @@
 - 本项目的评测问题都有唯一数值答案，用**金标准 SQL 在同一个库上执行一遍**就是标准答案；
 - 判分只比"值"，不比列名与列顺序——模型把列叫「销售额」还是「total_amount」不影响对错。
 
-三种判定模式：
+五种判定模式：
 - scalar：单值汇总题（总额、占比、客单价…），要求结果恰好 1 行，且期望值出现在该行；
 - text：答案是某个维度值（哪个区域最高、哪个月最好），取结果第一行判断是否包含该值；
-- table：多行结果（分组汇总、Top-N），比对行集合与每一列的值。
+- table：多行结果（分组汇总、Top-N），比对行集合与每一列的值；
+- refuse：**该拒答**——库里没有这段数据（如问 2024 年，库只有 2025）或没有这个字段
+  （如毛利率要成本字段），正确行为是说明答不了、不给数字。判"有没有编数"，不比文案；
+- clarify：**该澄清**——用户说的取值库里不存在（"办公用品"），正确行为是点明这个值不存在、
+  列出真实可选值，而不是静默换成"配件"给个数。
+
+后两种模式不平"值"判对错，而是判"有没有把不该给的数给出去"：
+新加这两类用例的直接原因，是原评测集 43 条全部有标准答案，模型硬编答案永远不会被发现。
 
 数值比较用容差而不是四舍五入：金额容差 0.011（覆盖两位小数的浮点误差），
 比率类题目可以在用例里把 atol 调小到 1e-4。
@@ -27,6 +34,14 @@ DEFAULT_ATOL = 0.011
 # 结果里常见的"装饰"：货币符号、千分位、单位后缀，比对前统一去掉
 _CURRENCY_RE = re.compile(r"^[¥$￥]\s*")
 _UNIT_RE = re.compile(r"\s*(元|件|个|笔|人|次|条)$")
+
+# 拒答模式的"说明标志"：出现任一，认为模型确实在交代"为什么答不了"，
+# 而不是默默返回空结果让用户猜。
+REFUSE_MARKERS = ("没有匹配", "没有数据", "无匹配", "没有找到", "查不到", "不存在",
+                  "无法", "未能", "超出", "未覆盖", "不支持", "没有相关", "缺少")
+
+# 不需要金标准答案的模式：判的是"该不该给数"，不是"数对不对"
+ABSTAIN_MODES = ("refuse", "clarify")
 
 
 @dataclass
@@ -170,11 +185,80 @@ def _rows_equal(gold: List[List[Any]], got: List[List[Any]],
     return not remaining
 
 
+# ---------------------------------------------------------------- 该拒答 / 该澄清
+
+def _has_payload(matrix: List[List[Any]]) -> bool:
+    """结果里是否有真实内容。
+
+    聚合空（SUM 无匹配）会返回 1 行 1 列 NaN，行数不为 0 但没有任何值 ——
+    这不算"给了数"，否则 refuse 用例会被聚合空误判为失败。
+    """
+    return any(cell is not None for row in matrix for cell in row)
+
+
+def _judge_abstain(result: Any, spec: dict, state: dict, mode: str) -> JudgeResult:
+    """判"该说不的时候有没有编数"。
+
+    三条判定，按严重程度排序：
+    1. 只要给出了带值的结果 → 失败（这是最危险的情况：用户拿到一个看起来正常、
+       实际口径错了的数字，比答不上来糟得多）；
+    2. 没有任何说明 → 失败（空结果 + 沉默，用户分不清是没数据还是系统坏了）；
+    3. clarify 额外要求点明"哪个值不存在"并列出可选值，否则用户没法继续改问。
+    """
+    frame = as_frame(result)
+    matrix = to_matrix(frame) if frame is not None and not frame.empty else []
+
+    if matrix and _has_payload(matrix):
+        return JudgeResult(
+            False, mode,
+            f"给出了 {len(matrix)} 行数据（首行 {_fmt_row(matrix[0])}），"
+            f"本应说明答不了 —— 很可能把不存在的条件放宽了，或用相近的字段/取值顶替")
+
+    answer = str(state.get("answer") or "").strip()
+    if not answer:
+        return JudgeResult(False, mode,
+                           "既没有结果也没有说明，用户分不清是没数据还是系统出错")
+
+    if mode == "clarify":
+        candidate = str(spec.get("expect_mention") or "")
+        values = [str(v) for v in (spec.get("expect_values") or [])]
+        if candidate and candidate not in answer:
+            return JudgeResult(False, mode,
+                               f"没有点明「{candidate}」这个库里不存在的取值"
+                               f"（回答：{answer[:60]}）")
+        if values:
+            hits = [v for v in values if v in answer]
+            if len(hits) < 2:
+                return JudgeResult(False, mode,
+                                   f"没有列出可选值（只提到 {hits}），用户没法继续改问")
+        note = "点明取值不存在并列出可选值"
+        if state.get("unknown_enum"):
+            note += "（由取值校验拦下，未调用模型）"
+        return JudgeResult(True, mode, note)
+
+    if not any(marker in answer for marker in REFUSE_MARKERS):
+        return JudgeResult(False, mode,
+                           f"结果为空但没交代原因，用户看不出该换成什么条件"
+                           f"（回答：{answer[:60]}）")
+    if "未能完成分析" in answer:
+        return JudgeResult(True, mode,
+                           "未编造数字，但以执行失败告终（应说明缺哪个字段）")
+    return JudgeResult(True, mode, "如实说明答不了，没有编造数字")
+
+
 # ---------------------------------------------------------------- 主入口
 
-def judge(result: Any, golds: List[pd.DataFrame], spec: dict) -> JudgeResult:
-    """按用例声明的 mode 判分；golds 为「标准答案 + 等价口径备选」，命中任一即通过。"""
+def judge(result: Any, golds: List[pd.DataFrame], spec: dict,
+          state: Optional[dict] = None) -> JudgeResult:
+    """按用例声明的 mode 判分；golds 为「标准答案 + 等价口径备选」，命中任一即通过。
+
+    refuse / clarify 两种模式需要看最终回答与澄清信息，所以额外接收 state
+    （执行器会把 GraphAgent 返回的 state 传进来）；其余模式不依赖它。
+    """
     mode = spec.get("mode", "table")
+    if mode in ABSTAIN_MODES:
+        return _judge_abstain(result, spec, state or {}, mode)
+
     atol = float(spec.get("atol", DEFAULT_ATOL))
 
     frame = as_frame(result)

@@ -52,13 +52,22 @@ from evals.judge import judge, to_matrix  # noqa: E402
 CASES_PATH = ROOT / "evals" / "cases.yaml"
 REPORT_DIR = ROOT / "evals" / "reports"
 
+# 有金标准答案、比"数对不对"的模式；以及比"该不该给数"的模式
+ANSWERABLE_MODES = ("scalar", "text", "table")
+ABSTAIN_MODES = ("refuse", "clarify")
+VALID_MODES = ANSWERABLE_MODES + ABSTAIN_MODES
+
 # Windows 控制台默认 GBK，强制 UTF-8 避免中文与符号打印报错
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
 def load_cases() -> list:
-    """读取评测集并做基本校验。"""
+    """读取评测集并做基本校验。
+
+    refuse / clarify 两类用例没有金标准 SQL —— 它们判的是"该不该给数"，
+    不是"数对不对"，所以只校验模式相关字段。
+    """
     data = yaml.safe_load(CASES_PATH.read_text(encoding="utf-8"))
     cases = data.get("cases") or []
     if not cases:
@@ -72,15 +81,26 @@ def load_cases() -> list:
         if cid in seen:
             raise SystemExit(f"用例 id 重复：{cid}")
         seen.add(cid)
-        if not case.get("gold_sql"):
+        if not case.get("question"):
+            raise SystemExit(f"用例 {cid} 缺少 question")
+
+        mode = case.get("mode")
+        if mode not in VALID_MODES:
+            raise SystemExit(f"用例 {cid} 的 mode 非法：{mode}")
+        if mode in ANSWERABLE_MODES and not case.get("gold_sql"):
             raise SystemExit(f"用例 {cid} 缺少 gold_sql")
-        if case.get("mode") not in ("scalar", "text", "table"):
-            raise SystemExit(f"用例 {cid} 的 mode 非法：{case.get('mode')}")
+        if mode == "clarify" and not case.get("expect_values"):
+            raise SystemExit(f"用例 {cid} 是澄清题，必须给出 expect_values（真实可选值）")
     return cases
 
 
 def run_gold(case: dict, db_path: str) -> list:
-    """执行金标准 SQL，返回标准答案 DataFrame 列表（首个为主口径，其余为等价口径）。"""
+    """执行金标准 SQL，返回标准答案 DataFrame 列表（首个为主口径，其余为等价口径）。
+
+    该拒答 / 该澄清的用例没有金标准，返回空列表。
+    """
+    if not case.get("gold_sql"):
+        return []
     sqls = [case["gold_sql"]] + list(case.get("alt_sql") or [])
     frames = []
     for sql in sqls:
@@ -113,6 +133,10 @@ def dry_run(cases: list, db_path: str) -> None:
     """只跑金标准 SQL，确认评测集自洽（不调用模型、不产生费用）。"""
     print(f"校验评测集：{len(cases)} 条用例，数据库 {db_path}\n")
     for i, case in enumerate(cases, 1):
+        if case["mode"] in ABSTAIN_MODES:
+            what = "澄清并列出可选值" if case["mode"] == "clarify" else "如实说明答不了"
+            print(f"[{i:2d}/{len(cases)}] {case['id']} {case['mode']:7s} 期望：{what}（无金标准）")
+            continue
         frames = run_gold(case, db_path)
         gold = frames[0]
         matrix = to_matrix(gold)
@@ -120,7 +144,7 @@ def dry_run(cases: list, db_path: str) -> None:
         head = ", ".join(str(v) for v in preview[:4])
         extra = f"（{len(matrix)} 行）" if len(matrix) > 1 else ""
         alts = f" +{len(frames) - 1} 个等价口径" if len(frames) > 1 else ""
-        print(f"[{i:2d}/{len(cases)}] {case['id']} {case['mode']:6s} {head}{extra}{alts}")
+        print(f"[{i:2d}/{len(cases)}] {case['id']} {case['mode']:7s} {head}{extra}{alts}")
     print("\n评测集校验通过，可以正式运行：python -m evals.run_eval")
 
 
@@ -132,6 +156,17 @@ def percentile(values: list, ratio: float) -> float:
     pos = (len(ordered) - 1) * ratio
     low, high = int(pos), min(int(pos) + 1, len(ordered) - 1)
     return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def expected_preview(case: dict, golds: list) -> str:
+    """失败复盘用的"期望"文本：有金标准就摆数值，没有就摆行为要求。"""
+    if golds:
+        return ", ".join(str(v) for v in to_matrix(golds[0])[0][:4])
+    if case["mode"] == "clarify":
+        candidate = case.get("expect_mention") or "该取值"
+        values = " / ".join(str(v) for v in (case.get("expect_values") or []))
+        return f"说明「{candidate}」不在库里，并列出：{values}"
+    return "说明这段数据/字段不存在，不给数字"
 
 
 def run_one(agent: GraphAgent, case: dict, golds: list, with_insight: bool) -> dict:
@@ -152,9 +187,8 @@ def run_one(agent: GraphAgent, case: dict, golds: list, with_insight: bool) -> d
 
     result = state.get("result")
     if error_text:
-        verdict = judge(None, golds, case)
-    else:
-        verdict = judge(result, golds, case)
+        state = {**state, "answer": state.get("answer") or error_text}
+    verdict = judge(result, golds or [], case, state=state)
 
     actual_preview = ""
     if result is not None and not getattr(result, "empty", True):
@@ -163,7 +197,10 @@ def run_one(agent: GraphAgent, case: dict, golds: list, with_insight: bool) -> d
         except Exception:
             actual_preview = str(result)[:120]
 
-    expected_preview = ", ".join(str(v) for v in to_matrix(golds[0])[0][:4])
+    abstain = case["mode"] in ABSTAIN_MODES
+    # 该拒答/该澄清的用例本来就不该有结果，成功与否看判分结论，而不是"有没有拿到数"
+    success = bool(verdict.matched) if abstain else (
+        result is not None and not getattr(result, "empty", True))
 
     return {
         "id": case["id"],
@@ -171,12 +208,13 @@ def run_one(agent: GraphAgent, case: dict, golds: list, with_insight: bool) -> d
         "question": case["question"],
         "mode": case.get("mode"),
         "route": state.get("route", ""),
+        "clarify": bool(state.get("unknown_enum")),
         "rewritten": state.get("rewritten_question", ""),
         "statement": (state.get("statement") or "").strip(),
         "matched": bool(verdict.matched),
         "judge_mode": verdict.mode,
         "judge_detail": verdict.detail,
-        "success": result is not None and not getattr(result, "empty", True),
+        "success": success,
         "retries": int(state.get("retry_count") or 0),
         "errors": state.get("errors") or [],
         "error": error_text or state.get("error", ""),
@@ -185,16 +223,24 @@ def run_one(agent: GraphAgent, case: dict, golds: list, with_insight: bool) -> d
         "input_tokens": counter.input_tokens,
         "output_tokens": counter.output_tokens,
         "rows": 0 if result is None else int(len(result)),
-        "expected": expected_preview,
-        "actual": actual_preview,
+        "expected": expected_preview(case, golds),
+        "actual": actual_preview or (state.get("answer") or "")[:120],
+        "answer": (state.get("answer") or "")[:300],
     }
 
 
 def summarize(records: list) -> dict:
-    """汇总指标。"""
+    """汇总指标。
+
+    「执行成功率」只统计有标准答案的题（分母不同就该分开写）：
+    该拒答/该澄清的用例本来就不该产出结果，混进去会把指标拉低，
+    它们单独由「拒答/澄清正确率」衡量。
+    """
     n = len(records)
     matched = sum(1 for r in records if r["matched"])
-    success = sum(1 for r in records if r["success"])
+    answerable = [r for r in records if r["mode"] not in ABSTAIN_MODES]
+    abstain = [r for r in records if r["mode"] in ABSTAIN_MODES]
+    success = sum(1 for r in answerable if r["success"])
     retried = [r for r in records if r["retries"] > 0]
     recovered = sum(1 for r in retried if r["matched"])
     first_pass = sum(1 for r in records if r["matched"] and r["retries"] == 0)
@@ -212,8 +258,13 @@ def summarize(records: list) -> dict:
         "total": n,
         "matched": matched,
         "accuracy": round(matched / n, 4) if n else 0.0,
+        "answerable": len(answerable),
         "success": success,
-        "success_rate": round(success / n, 4) if n else 0.0,
+        "success_rate": round(success / len(answerable), 4) if answerable else 0.0,
+        "abstain_total": len(abstain),
+        "abstain_matched": sum(1 for r in abstain if r["matched"]),
+        "abstain_rate": round(sum(1 for r in abstain if r["matched"]) / len(abstain), 4)
+        if abstain else 0.0,
         "first_pass": first_pass,
         "first_pass_rate": round(first_pass / n, 4) if n else 0.0,
         "retried": len(retried),
@@ -249,7 +300,10 @@ def build_report(records: list, stats: dict, args) -> str:
         "| 指标 | 数值 | 说明 |",
         "| --- | --- | --- |",
         f"| **准确率** | **{stats['matched']}/{stats['total']}（{stats['accuracy']:.1%}）** | 判分通过 / 全部用例 |",
-        f"| 执行成功率 | {stats['success']}/{stats['total']}（{stats['success_rate']:.1%}） | 拿到非空结果 |",
+        f"| 执行成功率 | {stats['success']}/{stats['answerable']}"
+        f"（{stats['success_rate']:.1%}） | 拿到非空结果（仅统计有标准答案的题） |",
+        f"| 拒答/澄清正确率 | {stats['abstain_matched']}/{stats['abstain_total']}"
+        f"（{stats['abstain_rate']:.1%}） | 该说不的时候有没有编数 |",
         f"| 一次通过率 | {stats['first_pass']}/{stats['total']}（{stats['first_pass_rate']:.1%}） | 首次生成即正确，无需重试 |",
         f"| 自愈修复率 | {stats['recovered']}/{stats['retried']}"
         f"（{stats['recovery_rate']:.1%}） | 发生过重试并最终正确 |",
@@ -293,6 +347,11 @@ def build_report(records: list, stats: dict, args) -> str:
               "- 判分只比结果值，不比列名与列顺序；数值走容差（默认 0.011），"
               "占比类同时接受百分比与小数两种写法。",
               "- 标准答案由金标准 SQL 在同一份库上现算，不是手工抄写，避免抄错。",
+              "- **该拒答 / 该澄清两类用例没有标准答案**：判的是「该不该给数」。"
+              "只要给出了带值的结果就判失败——用户拿到一个口径被替换过的数字，"
+              "比被告知「查不到」严重得多。",
+              "- 执行成功率的分母是「有标准答案的题」（拒答/澄清本来就不该有结果，"
+              "混进去会把指标拉低），它们单独看「拒答/澄清正确率」。",
               "- 评测数据为模拟销售库；换真实业务库时只需改 `evals/cases.yaml` 里的 `gold_sql` 表名。",
               "- 成本口径：DeepSeek 输入/输出 token 数，费用按官方价自行折算。"]
     if stats["retried"] == 0:
@@ -380,8 +439,10 @@ def main() -> None:
     print("\n" + "=" * 60)
     print(f"准确率      {stats['matched']}/{stats['total']}  "
           f"({stats['accuracy']:.1%})")
-    print(f"执行成功率  {stats['success']}/{stats['total']}  "
-          f"({stats['success_rate']:.1%})")
+    print(f"执行成功率  {stats['success']}/{stats['answerable']}  "
+          f"({stats['success_rate']:.1%})  仅统计有标准答案的题")
+    print(f"拒答/澄清   {stats['abstain_matched']}/{stats['abstain_total']}  "
+          f"({stats['abstain_rate']:.1%})  该不该给数")
     print(f"一次通过率  {stats['first_pass']}/{stats['total']}  "
           f"({stats['first_pass_rate']:.1%})")
     print(f"自愈修复率  {stats['recovered']}/{stats['retried']}  "

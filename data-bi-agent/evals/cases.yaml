@@ -7,10 +7,13 @@
 #
 # 字段说明：
 #   mode        scalar（单值汇总，要求 1 行）/ text（答案是某个维度值）/ table（多行结果）
-#   gold_sql    金标准 SQL，在本项目的只读库上执行得到期望结果
+#               refuse（该拒答：库里没有这段数据或没有这个字段）/ clarify（该澄清：取值不存在）
+#   gold_sql    金标准 SQL，在本项目的只读库上执行得到期望结果（refuse/clarify 不需要）
 #   alt_sql     可选，等价口径（例如占比用小数还是百分比），命中任意一个即算对
 #   allow_multi_row / allow_extra_cols  放宽行数、列数限制，默认都关闭
 #   atol        数值容差，默认 0.011（覆盖两位小数的浮点误差）；比率类可调小
+#   expect_mention / expect_values      仅 clarify 用：必须点明的未知取值、必须列出的真实可选值
+#   note        这条用例为什么值得测（给未来的自己看）
 
 meta:
   dataset: data/sales.db
@@ -308,3 +311,73 @@ cases:
     question: 华南那边哪个客户买得最多？
     gold_sql: "SELECT c.customer_name FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE c.region = '华南' GROUP BY c.customer_id ORDER BY SUM(o.amount) DESC LIMIT 1"
     mode: text
+
+  # ============ K 该拒答（数据或字段不存在，不能编答案）============
+  # 判分口径：只要给出带值的结果就判失败。用户拿到一个口径被替换过的数字，
+  # 比被告知"查不到"严重得多 —— 这是原评测集最大的盲区（43 条全都有答案）。
+  - id: K01
+    category: 该拒答
+    question: 2024 年的总销售额是多少？
+    mode: refuse
+    note: 库内只有 2025 年数据。聚合型空结果（SUM 返回 1 行 NULL）最容易被当成"有结果"，
+      然后由 LLM 圆成"数据缺失，需核查数据源"
+
+  - id: K02
+    category: 该拒答
+    question: 2024 年 3 月的订单明细有哪些？
+    mode: refuse
+    note: 明细型空结果，会触发一次"放宽条件"重试。若放宽时把年份改成 2025，
+      就是拿别的年度冒充 2024 —— 曾实测连续 3 次都这么改
+
+  - id: K03
+    category: 该拒答
+    question: 每个商品的毛利率是多少？
+    mode: refuse
+    note: 库中没有成本/进价字段。曾实测模型用 unit_price 当成本算出 -78% 的毛利率并照实汇报
+
+  - id: K04
+    category: 该拒答
+    question: 按省份统计销售额
+    mode: refuse
+    note: customers 只有 region（大区），没有省份字段。换成 region 就是把统计粒度改了，
+      数字看着正常但答的不是这个问题
+
+  - id: K05
+    category: 该拒答
+    question: 各商品的退货率是多少？
+    mode: refuse
+    note: 库中没有退货字段/退货表。曾实测模型先说"无法计算"，重试后改成算订单量交差
+
+  # ============ J 该澄清（取值不存在，不能静默映射）============
+  # 判分口径：不许给数字；必须点明哪个值不存在，并列出真实可选值，否则用户没法继续。
+  - id: J01
+    category: 该澄清
+    question: 办公用品类产品的销售额是多少？
+    mode: clarify
+    expect_mention: 办公用品
+    expect_values: [平板, 手机, 智能家居, 笔记本, 配件]
+    note: 曾实测被静默映射成"配件"，给出 395,283.75
+
+  - id: J02
+    category: 该澄清
+    question: 电脑类产品一共卖了多少？
+    mode: clarify
+    expect_mention: 电脑
+    expect_values: [平板, 手机, 智能家居, 笔记本, 配件]
+    note: 曾实测被静默映射成"笔记本"，给出 7,524,472.00
+
+  - id: J03
+    category: 该澄清
+    question: 东北地区的销售额是多少？
+    mode: clarify
+    expect_mention: 东北
+    expect_values: [华东, 华中, 华北, 华南, 西南]
+    note: 区域取值里没有东北（地理上很像，但不是库里的写法），属于最容易混淆的一类
+
+  - id: J04
+    category: 该澄清
+    question: 临时客户等级的销售额是多少？
+    mode: clarify
+    expect_mention: 临时客户
+    expect_values: [战略客户, 普通客户, 重点客户]
+    note: 客户等级只有三档，凭空多出的等级不能被就近归到"普通客户"
