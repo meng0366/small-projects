@@ -26,6 +26,7 @@ from app.schema.loader import (
 )
 from app.tools.lesson_store import known_words as lesson_known_words
 from app.tools.lesson_store import load_lessons
+from app.tools.time_anchor import resolve_time_anchor
 
 
 @dataclass
@@ -72,6 +73,26 @@ class AgentContext:
     def enums(self) -> list:
         """枚举列的真实取值（取自数据画像），供取值校验与范围守卫共用。"""
         return list(self.data_profile.get("enums") or [])
+
+    @property
+    def today(self):
+        """相对时间的参考日。默认运行当天，`AGENT_TODAY` 可固定口径。"""
+        from app.config import AGENT_TODAY
+        from app.tools.time_anchor import to_date
+        return to_date(AGENT_TODAY) if AGENT_TODAY else to_date(None)
+
+    @property
+    def date_coverage(self) -> dict:
+        """主日期列的覆盖范围 {min, max}，供时间锚点判断是否无交集。"""
+        for item in self.data_profile.get("date_ranges") or []:
+            if str(item.get("column", "")).lower() in ("order_date", "date", "ordertime"):
+                return {"min": item.get("min"), "max": item.get("max")}
+        ranges = self.data_profile.get("date_ranges") or []
+        return dict(ranges[0]) if ranges else {}
+
+    def time_anchors(self, question: str) -> list:
+        """解析相对时间（`today` 与覆盖范围来自本上下文）。"""
+        return resolve_time_anchor(question, today=self.today, coverage=self.date_coverage)
 
     @cached_property
     def catalog(self) -> dict:

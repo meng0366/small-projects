@@ -19,6 +19,7 @@ from app.prompts.templates import REWRITE_SYSTEM, REWRITE_USER_TEMPLATE
 from app.state import AgentState
 from app.tools.attribution import detect_attribution
 from app.tools.enum_guard import find_unknown_enum
+from app.tools.time_anchor import format_time_hint, out_of_range_answer
 
 HISTORY_LIMIT = 6  # 最多带入 6 条历史（约 3 轮）
 
@@ -75,14 +76,28 @@ def make_understand_node(ctx: AgentContext):
         # 硬做只会拆出一张对不上的表，不如老实用普通问答。
         intent = detect_attribution(rewritten, ctx.enums) if route == "sql" else None
 
+        # 相对时间锚点（P0）：今天由系统给，代码算成显式日期区间。
+        # 两类结果：
+        # - 完全无交集（今天 2026-11 问"上个月"，库只到 2025-12）→ 直接拒答，
+        #   不调 LLM，也不许换一个有数据的月份顶替（P0-2b 同款风险）；
+        # - 有交集 → 把锚点写进 terms，随 schema 一起进提示词，
+        #   让模型照着显式区间写 SQL，而不是自己猜"今天"。
+        anchors = ctx.time_anchors(rewritten)
+        terms = ctx.terms
+        hint = format_time_hint(anchors, today=ctx.today, coverage=ctx.date_coverage)
+        if hint:
+            terms = (terms + "\n\n" + hint).strip() if terms else hint
+        time_defer = out_of_range_answer(anchors, ctx.date_coverage)
+
         return {
             "rewritten_question": rewritten,
             "route": route,
             "schema_info": schema_info,
-            "terms": ctx.terms,
+            "terms": terms,
             "retry_count": state.get("retry_count", 0),
             "unknown_enum": unknown,
             "attribution_intent": intent,
+            "time_defer": time_defer,
         }
 
     return node

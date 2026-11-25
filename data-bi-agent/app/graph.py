@@ -315,7 +315,14 @@ def make_clarify_node(ctx: AgentContext):
     """
 
     def node(state: AgentState) -> dict:
-        answer = build_clarify_answer(state.get("unknown_enum") or {})
+        # 相对时间完全落在数据覆盖之外（P0）：直接说明没有数据。
+        # 与取值澄清共用这个终止节点，都不该进生成 —— 让模型去"放宽时间"
+        # 正是 P0-2b 拿回别的年份数据冒充的起点。
+        time_defer = (state.get("time_defer") or "").strip()
+        if time_defer:
+            answer = time_defer
+        else:
+            answer = build_clarify_answer(state.get("unknown_enum") or {})
         return {"answer": answer, "insight": answer,
                 "chart_type": "none", "chart_path": "", "result": None}
 
@@ -323,8 +330,10 @@ def make_clarify_node(ctx: AgentContext):
 
 
 def route_after_understand(state: AgentState) -> str:
-    """条件边：取值对不上先澄清，对得上才去生成。"""
-    return "clarify" if state.get("unknown_enum") else "generate"
+    """条件边：取值对不上、或相对时间超出覆盖范围，都先澄清不生成。"""
+    if state.get("time_defer") or state.get("unknown_enum"):
+        return "clarify"
+    return "generate"
 
 
 # ---------------------------------------------------------------- 链路追踪（P2-2）

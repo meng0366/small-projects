@@ -41,6 +41,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
+# 相对时间的参考日（P0 时间锚点）。默认取运行当天；设为 'YYYY-MM-DD' 可固定口径，
+# 例如做历史数据回放或让"上个月"始终指某个已知月份，便于复现与测试。
+AGENT_TODAY = _read_setting("AGENT_TODAY", "")
+
 # ---------------------------------------------------------------- 安全限额
 MAX_QUESTION_CHARS = int(_read_setting("AGENT_MAX_QUESTION_CHARS", "2000"))
 """单次提问的最大字符数，防止超长文本把上下文撑爆。"""

@@ -16,6 +16,9 @@
   # 5. 连图表与洞察一起测（更接近真实体验，但更慢更贵）
   python -m evals.run_eval --with-insight
 
+  # 6. 固定相对时间的参考日（评测「上个月」这类问题必须固定，否则随日期漂移）
+  python -m evals.run_eval --today 2026-11-25
+
 输出：
 - 控制台：逐条结果 + 汇总指标
 - evals/reports/eval-时间戳.md   人读的报告
@@ -405,6 +408,8 @@ def main() -> None:
     parser.add_argument("--max-retries", type=int, default=2, help="最大重试次数，默认 2")
     parser.add_argument("--tag", default="", help="报告文件名后缀，便于区分多次运行")
     parser.add_argument("--out-dir", default="", help="报告输出目录，默认 evals/reports")
+    parser.add_argument("--today", default="",
+                        help="固定相对时间的参考日 YYYY-MM-DD；不填则用运行当天")
     parser.add_argument("--with-lessons", action="store_true",
                         help="启用修正回流（few-shot）；默认关闭，基线以冷启动口径比较")
     args = parser.parse_args()
@@ -412,6 +417,12 @@ def main() -> None:
     global REPORT_DIR
     if args.out_dir:
         REPORT_DIR = Path(args.out_dir).resolve()
+
+    # 固定"今天"：相对时间用例（K06）必须锁定参考日，否则同一条用例
+    # 在不同日期跑会得到"该拒答"和"该给数"两种相反结论。
+    if args.today:
+        import app.config as _cfg
+        _cfg.AGENT_TODAY = args.today
 
     cases = select_cases(load_cases(), args)
     # 默认**不带**修正记录（use_lessons=False）：基线要反映冷启动表现。
@@ -430,6 +441,9 @@ def main() -> None:
 
     records = []
     for i, case in enumerate(cases, 1):
+        # 用例可自带参考日（相对时间场景），优先级高于命令行全局 --today。
+        import app.config as _cfg
+        _cfg.AGENT_TODAY = str(case.get("today") or args.today or "")
         golds = run_gold(case, agent.ctx.db_path)
         record = run_one(agent, case, golds, args.with_insight)
         records.append(record)

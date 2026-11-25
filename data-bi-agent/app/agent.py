@@ -27,6 +27,7 @@ from app.nodes.generate import generate_code, generate_sql
 from app.nodes.reflect import is_aggregate_empty, is_empty_result
 from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
+from app.tools.time_anchor import format_time_hint, out_of_range_answer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -44,6 +45,7 @@ class AskResult:
     summary: str = ""
     trace_id: str = ""              # 本次问答的追踪号（P2-2），阶段事件与汇总行共用
     errors: List[str] = field(default_factory=list)
+    refuse_reason: str = ""         # 理解阶段直接拒答的原因（P0 时间锚点），无生成无执行
 
     @property
     def ok(self) -> bool:
@@ -128,7 +130,8 @@ class DataAgent:
             "errors": list(res.errors),
             "retry_count": 0,
             "trace_id": res.trace_id,
-            "answer": "" if res.ok else "未能完成分析。",
+            "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
+            "insight": res.refuse_reason or res.insight,
             "suggestions": [],
         }
         try:
@@ -144,13 +147,32 @@ class DataAgent:
         trace = trace_id or new_trace_id()
         res = AskResult(question=question, trace_id=trace)
 
+        # 相对时间锚点（P0）：与状态机同一套判定。今天由系统给，
+        # 完全没交集就直接说明，绝不让模型"换个有数据的月份"来答。
+        anchors = self.ctx.time_anchors(question)
+        refuse = out_of_range_answer(anchors, self.ctx.date_coverage)
+        if refuse:
+            res.refuse_reason = refuse
+            log_event(trace, "answer", ms=0, failed=True)
+            log_run(ok=False, trace_id=trace, engine="linear", route="refuse",
+                    retries=0, rows=0, empty=False, chart="none",
+                    elapsed=round(time.perf_counter() - started, 2),
+                    question=(question or "")[:200], question_len=len(question or ""),
+                    errors=0, error="时间超出数据覆盖范围")
+            return res
+
+        # 有交集时把锚点拼进术语，随 schema 一起进提示词（两条引擎一致）。
+        hint = format_time_hint(anchors, today=self.ctx.today,
+                                coverage=self.ctx.date_coverage)
+        terms = (self.terms + "\n\n" + hint).strip() if hint else self.terms
+
         if self.db_path and not force_pandas:
-            self._try_sql(question, res)
+            self._try_sql(question, res, terms=terms)
 
         # SQL 失败才回退 pandas；回退这件事本身要写进链里，否则看不出"为什么慢/为什么换了路线"
         fallback = res.df is None and bool(self.db_path) and not force_pandas
         if res.df is None:
-            self._try_pandas(question, res, fallback=fallback)
+            self._try_pandas(question, res, fallback=fallback, terms=terms)
 
         if res.df is not None:
             answered = time.perf_counter()
@@ -185,11 +207,11 @@ class DataAgent:
         )
         return res
 
-    def _try_sql(self, question: str, res: AskResult) -> None:
+    def _try_sql(self, question: str, res: AskResult, terms: str = None) -> None:
         trace = res.trace_id
         started = time.perf_counter()
         try:
-            sql = generate_sql(self.db_schema, self.terms, question)
+            sql = generate_sql(self.db_schema, terms or self.terms, question)
         except Exception as e:
             msg = f"SQL 生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)
@@ -216,11 +238,12 @@ class DataAgent:
                       ms=round((time.perf_counter() - started) * 1000),
                       **trace_fields({"route": "sql", "error": msg}, failed=True))
 
-    def _try_pandas(self, question: str, res: AskResult, fallback: bool = False) -> None:
+    def _try_pandas(self, question: str, res: AskResult, fallback: bool = False,
+                    terms: str = None) -> None:
         trace = res.trace_id
         started = time.perf_counter()
         try:
-            code = generate_code(self.df_schema, self.terms, question)
+            code = generate_code(self.df_schema, terms or self.terms, question)
         except Exception as e:
             msg = f"代码生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)
