@@ -44,11 +44,12 @@ FEW_SHOT_EXAMPLES = [
     ),
 ]
 
-USER_TEMPLATE = """{schema}
-
-{terms}
-
-用户问题：{question}
+# 注意：schema / terms **不在这里**，它们由 `_build_messages` 拼进 system 消息。
+# 放在这里会被每一条 few-shot 示例各带一份 —— 实测 4 次重复占了整份 prompt 的 82%
+# （schema 1299 字符 + terms 198 字符，重复 4 次 = 5988 / 7313 字符）。
+# 放 system 还有一个好处：system + 示例是**跨问题不变的前缀**，DeepSeek 的上下文缓存
+# 只在相同前缀上命中，重复就白花钱。
+USER_TEMPLATE = """用户问题：{question}
 
 请只输出 Python 代码。"""
 
@@ -117,11 +118,7 @@ FEW_SHOT_SQL = [
     ),
 ]
 
-SQL_USER_TEMPLATE = """{schema}
-
-{terms}
-
-用户问题：{question}
+SQL_USER_TEMPLATE = """用户问题：{question}
 
 请只输出一条 SQL 语句。"""
 

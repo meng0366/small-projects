@@ -29,6 +29,31 @@ from app.prompts.templates import (
 from app.tools.attribution import describe_comparison
 
 
+SCHEMA_BLOCK_HEADER = "数据结构与口径（唯一权威来源，下面的示例里不再重复）："
+"""schema 块的引导语。放在 system 里只出现一次，见 `_system_with_context`。"""
+
+
+def _system_with_context(system: str, schema_info: str, terms: str) -> str:
+    """把 schema 与术语拼进 system 消息（整份 prompt 里只出现一次）。
+
+    以前它们是 `user_template` 的占位符，于是**每条 few-shot 示例都带一份**：
+    实测 schema 1299 字符 + 术语 198 字符，重复 4 次（3 条示例 + 当前问题），
+    在 7313 字符的 prompt 里占了 5988 —— 82% 是纯重复。
+    挪进 system 后：① 上下文长度大降；② system + 示例构成**跨问题不变的前缀**，
+    DeepSeek 的上下文缓存在相同前缀上才命中，重复的部分本来也拿不到缓存收益；
+    ③ 示例只剩"问题 → 答案"，更像在教"怎么写"，而不是在教"表长什么样"。
+
+    刻意保留 `user_template` 里的 `{schema}` / `{terms}` 占位符兼容：
+    `str.format` 对多余的关键字参数是忽略的，所以老的调用方式不会报错。
+    """
+    blocks = [system]
+    if schema_info:
+        blocks.append(f"{SCHEMA_BLOCK_HEADER}\n{schema_info}")
+    if terms:
+        blocks.append(terms)
+    return "\n\n".join(blocks)
+
+
 def _build_messages(system: str, examples: list, user_template: str,
                     schema_info: str, terms: str, question: str,
                     previous_error: str = None, kind: str = "SQL",
@@ -49,7 +74,7 @@ def _build_messages(system: str, examples: list, user_template: str,
     第一条 lesson 前面还要加一句"已确认口径"——实测光给示例，模型仍会以
     "这个词没有定义"为由拒答，必须明说这条写法本身就是定义。
     """
-    messages = [SystemMessage(content=system)]
+    messages = [SystemMessage(content=_system_with_context(system, schema_info, terms))]
 
     pairs = list(examples or [])
     for q, output in pairs:
