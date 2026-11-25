@@ -15,6 +15,8 @@
     python -m app.cli logs --trace 20261124-225251-cb5d   # 看某一次的各阶段耗时
     python -m app.cli teach "问题" --sql "SELECT ..."   # 把答错的问题教成 few-shot
     python -m app.cli lessons              # 查看 / 删除已沉淀的修正记录
+    python -m app.cli catalog --db 我的库.db          # 给陌生的库自动生成语义词典草稿
+    python -m app.cli catalog --db 我的库.db --dry-run  # 只看代码能自动认出什么（零成本）
 
 设计取舍（借鉴来源见 docs/参考项目记录.md 第 7–9 节）：
 - **只用标准库 argparse**：项目已经带了 LangChain 一大串依赖，CLI 层不再引入
@@ -47,6 +49,19 @@ from app.render import (
 )
 from app.schema.loader import list_tables, load_catalog
 from app.tools.chart_tool import CHART_TYPE_LABEL
+from app.tools.catalog_gen import (
+    CatalogError,
+    build_draft,
+    count_todos,
+    describe_changes,
+    format_profile,
+    generate_descriptions,
+    parse_draft,
+    profile_schema,
+    render_catalog_yaml,
+    summarize_profile,
+    validate_draft,
+)
 from app.tools.lesson_store import (
     LessonError,
     add_lesson,
@@ -65,11 +80,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.11.0"
-"""与项目阶段对齐：0.9 = 第九轮调研的守卫与归因增强；0.10 = 计划先行（P1）。"""
+VERSION = "0.12.0"
+"""与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
-               "teach", "t", "lessons", "ls", "version", "help")
+               "teach", "t", "lessons", "ls", "catalog", "cat", "version", "help")
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
 ROUTE_LABEL = {
@@ -93,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m app.cli schema\n"
             "  python -m app.cli logs -n 5 --failed\n"
             "  python -m app.cli teach \"各城市的销售额是多少？\" --sql \"SELECT ...\"\n"
+            "  python -m app.cli catalog --db 我的库.db --dry-run\n"
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -155,6 +171,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="看某个问题会命中哪几条记录（调试相关度用）")
     lessons.add_argument("--json", action="store_true", help="以 JSON 输出")
     lessons.add_argument("--db", metavar="PATH", help="使用指定的 SQLite 库文件")
+
+    catalog_cmd = sub.add_parser(
+        "catalog", aliases=["cat"],
+        help="从一个陌生的库生成语义词典草稿（描述自动生成）")
+    catalog_cmd.add_argument("--db", metavar="PATH", required=True,
+                             help="要生成词典的 SQLite 库文件")
+    catalog_cmd.add_argument("-o", "--out", metavar="PATH", default="",
+                             help="草稿输出路径（默认当前目录下的 catalog.draft.yaml）")
+    catalog_cmd.add_argument("--dry-run", action="store_true",
+                             help="只做代码侧识别、不调模型（零成本，先看能自动认出什么）")
+    catalog_cmd.add_argument("--merge", metavar="PATH",
+                             help="与已有词典合并：已有的非空内容一律保留，只补空缺")
+    catalog_cmd.add_argument("--json", action="store_true", help="以 JSON 输出（不写文件）")
 
     sub.add_parser("version", help="显示版本与当前数据源")
 
@@ -796,12 +825,120 @@ def run_lessons(args) -> int:
     return EXIT_OK
 
 
+def run_catalog(args) -> int:
+    """从一个陌生的库生成 catalog 草稿（描述自动生成）。
+
+    分两段跑：代码先实测（类型/样例/枚举/关系，零 token），模型再补语义
+    （中文名/说明/口径）。`--dry-run` 只跑第一段 —— 先花零成本看看自动能认出什么，
+    再决定值不值得花那一次调用。
+    """
+    db_path = args.db
+    profile = profile_schema(db_path)
+    if not profile["tables"]:
+        print("[错误] 这个库里没有可读的表。", file=sys.stderr)
+        for note in profile["notes"]:
+            print(f"  · {note}", file=sys.stderr)
+        return EXIT_FAILED
+
+    if getattr(args, "dry_run", False):
+        if getattr(args, "json", False):
+            print(json.dumps(profile, ensure_ascii=False, indent=2, default=str))
+            return EXIT_OK
+        print(f"数据源：{db_path}")
+        print(f"自动识别：{summarize_profile(profile)}")
+        for note in profile["notes"]:
+            print(f"  · 注意：{note}")
+        print("\n[--dry-run] 只做代码侧识别，未调用模型。认出来的事实如下：\n")
+        print(format_profile(profile))
+        print("\n去掉 --dry-run 再跑一次，让它补上中文名、说明与指标口径。")
+        return EXIT_OK
+
+    existing = None
+    if getattr(args, "merge", None):
+        existing = load_catalog(args.merge)
+        if not existing:
+            print(f"[错误] 找不到可合并的词典（或文件是空的）：{args.merge}", file=sys.stderr)
+            return EXIT_USAGE
+
+    llm_raw = ""
+    try:
+        llm_raw = generate_descriptions(profile)
+    except CatalogError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        return EXIT_FAILED
+    except Exception as e:
+        print(f"[错误] 调用模型失败：{type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_FAILED
+
+    llm_draft = parse_draft(llm_raw)
+    if llm_draft is None:
+        print("[错误] 模型返回的不是可解析的 JSON，未生成草稿（没写文件）。", file=sys.stderr)
+        print(f"  原始输出前 300 字：{llm_raw[:300]}", file=sys.stderr)
+        return EXIT_FAILED
+
+    issues = validate_draft(llm_draft, profile)
+    errors = [i for i in issues if i.get("level") == "error"]
+    warns = [i for i in issues if i.get("level") == "warn"]
+    draft = build_draft(profile, llm_draft, existing)
+
+    if getattr(args, "json", False):
+        print(json.dumps({"draft": draft, "issues": issues,
+                          "profile_summary": summarize_profile(profile)},
+                         ensure_ascii=False, indent=2, default=str))
+        return EXIT_OK
+
+    print(f"数据源：{db_path}")
+    print(f"自动识别：{summarize_profile(profile)}")
+    for note in profile["notes"]:
+        print(f"  · 注意：{note}")
+
+    if errors:
+        print(f"\n[已丢弃] 模型提到的 {len(errors)} 处表/列在库里不存在（不能让它们进词典）：")
+        for i in errors[:5]:
+            print(f"  · {i['message']}")
+        if len(errors) > 5:
+            print(f"  · ...（还有 {len(errors) - 5} 条）")
+    missing = [i for i in warns if i.get("kind") == "missing_column"]
+    if missing:
+        print(f"\n[待补] {len(missing)} 列没有中文名，草稿里已标 TODO")
+    dropped_terms = [i for i in warns if i.get("kind") == "bad_term"]
+    for i in dropped_terms:
+        print(f"  · 已忽略口径：{i['message']}")
+
+    out_path = args.out or "catalog.draft.yaml"
+    text = render_catalog_yaml(
+        draft, source=os.path.abspath(db_path),
+        generated_at=time.strftime("%Y-%m-%d %H:%M"),
+        notes=[f"模型提到的 {i['message'][:30]} 已丢弃" for i in errors[:3]],
+    )
+    out_abs = os.path.abspath(out_path)
+    parent = os.path.dirname(out_abs)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_abs, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+    print(f"\n草稿已写入：{out_abs}")
+    for line in describe_changes(draft, existing):
+        print(f"  {line}")
+    todos = count_todos(draft)
+    if todos:
+        print(f"  还有 {todos} 处 TODO 待确认（在文件里搜 TODO）")
+
+    print("\n下一步：")
+    print("  1) 打开草稿，搜 TODO，把缺的中文名与说明补上；")
+    print("  2) 覆盖到 app/schema/catalog.yaml 后生效。")
+    print("     只想补空缺、不动已有内容：--merge app/schema/catalog.yaml")
+    return EXIT_OK
+
+
 def run_version() -> int:
     ctx = AgentContext()
     print(f"数据分析 Agent v{VERSION}")
     print(f"模型：{LLM_MODEL}")
     print(f"数据源：{ctx.mode_label}")
-    print("命令：ask / chat / schema / logs / teach / lessons / version（-h 查看用法）")
+    print("命令：ask / chat / schema / logs / teach / lessons / catalog / version"
+          "（-h 查看用法）")
     return EXIT_OK
 
 
@@ -830,6 +967,8 @@ def main(argv: Optional[list] = None) -> int:
         return run_teach(args)
     if command in ("lessons", "ls"):
         return run_lessons(args)
+    if command in ("catalog", "cat"):
+        return run_catalog(args)
     if command == "version":
         return run_version()
     parser.print_help()

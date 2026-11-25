@@ -27,6 +27,9 @@ data/private/
 # 图表输出
 output/
 
+# 词典草稿：`catalog --db` 的产物，确认后应改名/覆盖到 catalog.yaml，草稿本身不入库
+catalog.draft.yaml
+
 # ============ IDE ============
 .vscode/
 .idea/

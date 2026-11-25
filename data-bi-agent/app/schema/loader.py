@@ -21,6 +21,16 @@ from app.config import DATA_DIR
 
 CATALOG_PATH = os.path.join(os.path.dirname(__file__), "catalog.yaml")
 
+
+def catalog_path(path: str = None) -> str:
+    """词典文件路径：显式参数 > 环境变量 `AGENT_CATALOG` > 内置 `app/schema/catalog.yaml`。
+
+    为什么留这个环境变量：接自己的库时，`catalog --db 我的库.db` 会生成一份草稿，
+    靠"覆盖内置文件"来启用太粗暴（换回示例库还得改回来，容易忘）。
+    设成 `AGENT_CATALOG=我的词典.yaml` 就能让整条链路都用它。
+    """
+    return path or os.getenv("AGENT_CATALOG") or CATALOG_PATH
+
 # 默认数据库（模拟销售库）
 DEFAULT_DB = "sales.db"
 
@@ -71,8 +81,9 @@ def build_schema_text(df: pd.DataFrame, max_examples: int = 3) -> str:
     return "\n".join(lines)
 
 
-def load_catalog_terms(path: str = CATALOG_PATH) -> str:
+def load_catalog_terms(path: str = None) -> str:
     """读取业务术语词典，格式化为 Prompt 可用的文本（F1.4）。"""
+    path = catalog_path(path)
     if not os.path.exists(path):
         return ""
     with open(path, "r", encoding="utf-8") as f:
@@ -87,8 +98,9 @@ def load_catalog_terms(path: str = CATALOG_PATH) -> str:
     return "\n".join(lines)
 
 
-def load_catalog(path: str = CATALOG_PATH) -> dict:
+def load_catalog(path: str = None) -> dict:
     """读取完整语义词典（表/字段释义、关系、术语）。"""
+    path = catalog_path(path)
     if not os.path.exists(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
