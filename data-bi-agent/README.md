@@ -281,7 +281,22 @@ python -m app.cli teach "每个商品的毛利率是多少？" \
 python -m app.cli lessons                      # 看已沉淀的记录
 python -m app.cli lessons --match "大单有多少"   # 看这个问题会命中哪几条、相关度多少
 python -m app.cli lessons --rm L001            # 删掉一条
+python -m app.cli lessons --json                # 机器可读（脚本/巡检用）
 ```
+
+参数速查：
+
+| 命令 | 参数 | 作用 |
+| --- | --- | --- |
+| `teach` | `问题`（位置参数） | 答错的那个问题，**写原话**，匹配靠它 |
+| | `-s, --sql` | 正确的 SQL（**必填**）；本来该拒答的写 `DEFER: 原因` |
+| | `-n, --note` | 备注：为什么这么改（只在本地展示，不进提示词） |
+| | `--force` | 跳过"入库前真跑一遍"的校验（不建议） |
+| | `--db PATH` | 这条修正属于哪个库（按库指纹隔离） |
+| `lessons` | `--match QUESTION` | 只显示会被这个问题命中的记录及相关度 |
+| | `--rm ID` | 删掉指定记录（同时清空该库的 SQL 复用缓存） |
+| | `--json` | 以 JSON 输出 |
+| | `--db PATH` | 指定库 |
 
 几条规则：
 
@@ -302,7 +317,17 @@ python -m app.cli lessons --rm L001            # 删掉一条
 python -m app.cli catalog --db 我的库.db --dry-run   # 先看代码能自动认出什么（零成本，不调模型）
 python -m app.cli catalog --db 我的库.db             # 生成 catalog.draft.yaml
 python -m app.cli catalog --db 我的库.db --merge app/schema/catalog.yaml   # 只补空缺，不动已有内容
+python -m app.cli catalog --db 我的库.db -o 我的草稿.yaml   # 换个输出路径
+python -m app.cli catalog --db 我的库.db --json      # 只打到标准输出，不写文件（脚本用）
 ```
+
+| 参数 | 作用 |
+| --- | --- |
+| `--db PATH` | 要分析的 SQLite 库（**必填**，只支持 SQLite） |
+| `-o, --out PATH` | 草稿写到哪里，默认 `catalog.draft.yaml` |
+| `--dry-run` | 只跑代码实测，不调模型 —— 零 token，先看自动识别到什么程度 |
+| `--merge PATH` | 把草稿合并进已有词典：**已有的不动**，只补空缺 |
+| `--json` | 结果以 JSON 打到标准输出，不落文件 |
 
 分工是这样的，这也是它不会写错的原因：
 
@@ -480,7 +505,7 @@ app/
 ├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
 ├── logging_utils.py     # 运行日志、token 计数与 trace_id 链路追踪（阶段事件 + 汇总行）
 ├── agent.py             # 线性编排（--linear 时使用，也写阶段日志）
-├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / catalog / serve）
+├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / teach / lessons / catalog / serve / version）
 ├── payload.py           # 结构化输出：CLI 的 -f json 与 MCP 工具共用同一份 payload
 ├── mcp_server.py        # MCP server：把 ask / get_schema / generate_catalog 暴露给别的 Agent
 ├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
@@ -491,6 +516,7 @@ app/
 │   └── catalog.yaml     # 业务语义词典（字段含义、指标口径、枚举值）
 ├── prompts/templates.py # Prompt 模板（代码/SQL/洞察/问题改写/错误修正）
 ├── nodes/
+│   ├── cache.py         # SQL 复用：命中历史查询就跳过生成与计划（首个节点）
 │   ├── understand.py    # 问题理解：多轮改写 + 路由判定 + 取值校验
 │   ├── generate.py      # Text-to-Pandas / Text-to-SQL 生成
 │   ├── execute.py       # Python 代码安全执行（AST 校验 + 超时 + 截断）
@@ -509,7 +535,8 @@ app/
     ├── plan_guard.py    # 计划校验：判定何时需要计划、解析与核对表/列/时间/取值（纯规则，零 token）
     ├── peek.py          # 两段式探查：白名单校验 + 只读执行 + 把取值压成可回灌的清单
     ├── catalog_gen.py   # 词典自动生成：实测画像 + 校验模型返回 + 合并三方 + 渲染带注释的 YAML
-    └── pandas_tool.py   # 预留
+    ├── sql_cache.py     # SQL 复用：缓存键、七条不复用判据、结果指纹、LRU 淘汰（纯函数层）
+    └── pandas_tool.py   # 预留占位（当前留空；pandas 路线实际在 nodes/execute.py）
 data/
 ├── sales.db             # 模拟销售库（SQLite，3 张关联表）
 ├── sales_orders.csv     # 模拟销售宽表
@@ -541,6 +568,11 @@ tests/
 ├── test_deploy.py       # 部署配置测试（12 个用例，含配置总闸）
 └── test_cli.py          # 命令行与新模块测试（55 个用例，全离线）
 CHANGELOG.md             # 变更说明（面向协作方：改了什么、行为差异、同步清单）
+LICENSE                  # MIT（版权人 雷佳山）
+requirements.txt         # 运行依赖
+requirements.lock.txt    # 锁版本依赖（要与我们完全一致的环境时用）
+requirements-mcp.txt     # 可选依赖：只有在 `serve` 跑 MCP server 时才需要
+hello_llm.py             # 自检脚本：确认 Key 与网络通不通
 Dockerfile               # 单镜像部署（含中文字体与健康检查）
 .github/workflows/tests.yml  # CI：每次推送跑离线测试并构建镜像（在仓库根，与项目同级）
 .streamlit/config.toml   # 界面主题与服务器配置
@@ -765,16 +797,17 @@ $ python -m app.cli ask "各区域的销售额是多少？"       # 第二次
 - 只读连接：`file:...?mode=ro`，写操作在连接层就被 SQLite 拒绝；
 - 只放行单条 `SELECT` / `WITH`，先剥注释再校验，防止用注释夹带关键字；
 - 14 个修改/危险关键字黑名单（`insert`/`drop`/`attach`/`pragma`/`load_extension` 等）；
-- 查询超时（默认 10 秒）：用 SQLite progress handler 中断，挡误写的笛卡尔积；
-- 结果行数上限（默认 200 行/次）。
+- 查询超时（默认 10 秒，`AGENT_SQL_TIMEOUT` 可调）：用 SQLite progress handler 中断，挡误写的笛卡尔积；
+- 结果行数上限（默认 200 行/次，`sql_tool.MAX_ROWS_DEFAULT`；MCP 侧默认截到 200 行并标注 `truncated`）。
 
 **pandas 路径（尽力防护，非强隔离）**
 
 - **AST 静态校验**：禁止 `import`、禁止访问下划线开头的内部属性（挡 `().__class__.__bases__` 逃逸链）、
   禁止 `to_csv`/`to_excel`/`to_sql` 等写盘方法、禁止 `eval`/`exec`/`open`/`getattr` 等名字；
-  代码复杂度上限 4000 个语法节点；
+  代码复杂度上限 4000 个语法节点（`AGENT_MAX_CODE_NODES`）；
 - **受限命名空间**：只注入白名单内置函数，`df` 传副本，原始数据不会被改；
-- **执行超时**（默认 20 秒）：代码跑在守护线程里，死循环不会卡死会话。
+- **结果行数硬上限** 20000 行（`AGENT_MAX_RESULT_ROWS`），超出截断并告知；
+- **执行超时**（默认 20 秒，`AGENT_EXEC_TIMEOUT` 可调）：代码跑在守护线程里，死循环不会卡死会话。
 
   > 已知局限：Python 无法强杀线程。若生成代码是不释放 GIL 的 C 层紧密计算（如 `sum(range(10**8))`），
   > 主线程要等它跑完才恢复。死循环、pandas/numpy 长任务这类真正会「卡死会话」的场景不受影响。
@@ -782,9 +815,34 @@ $ python -m app.cli ask "各区域的销售额是多少？"       # 第二次
 
 **通用**
 
-- 单次提问上限 2000 字符，运行日志只记问题前 200 字与指标，不落原始数据；
+- 单次提问上限 2000 字符（`AGENT_MAX_QUESTION_CHARS`），运行日志只记问题前 200 字与指标，不落原始数据；
 - 网页端默认每个会话最多 50 次提问（`AGENT_MAX_QUESTIONS` 可调），防止公开部署被刷额度；
 - `.env` 已被 `.gitignore` 忽略；云端部署用平台 secrets 或环境变量，不要提交密钥。
+
+### 可调参数一览（环境变量）
+
+上面这些限额都写在 `app/config.py`，**都能用环境变量覆盖**，不用改代码。
+按机器性能或数据规模调整时改这张表里的名字即可（写进 `.env` 或容器环境变量）：
+
+| 环境变量 | 默认 | 作用 | 什么时候改 |
+| --- | --- | --- | --- |
+| `DEEPSEEK_API_KEY` | 空 | 模型密钥，空则命令行拒绝启动 | 必填 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | 接口地址（OpenAI 兼容） | 换兼容网关时 |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | 模型名 | 想换更便宜/更强的模型时 |
+| `AGENT_TODAY` | 运行当天 | 相对时间的参考日（`YYYY-MM-DD`） | 历史回放、评测、复现「上个月」 |
+| `AGENT_CACHE` | 开启 | 设 `0` 关闭 SQL 复用（等同 `--no-cache`） | 批量跑评测、怀疑缓存时 |
+| `AGENT_HOME` | `~/.data-agent` | 会话 / 缓存 / 修正记录的根目录 | 想隔离多套环境时 |
+| `AGENT_CATALOG` | `app/schema/catalog.yaml` | 业务术语词典路径 | 接自己的库时 |
+| `AGENT_MAX_QUESTION_CHARS` | `2000` | 单次提问字符上限 | 需要贴长文本时 |
+| `AGENT_MAX_CODE_NODES` | `4000` | 生成代码的 AST 节点上限 | 复杂分析被误拦时 |
+| `AGENT_EXEC_TIMEOUT` | `20` | pandas 代码执行超时（秒） | 大数据量算不完时 |
+| `AGENT_SQL_TIMEOUT` | `10` | 单条 SQL 执行超时（秒） | 大表聚合超时时 |
+| `AGENT_MAX_RESULT_ROWS` | `20000` | pandas 结果的硬行数上限 | 结果被截断时 |
+| `AGENT_MAX_QUESTIONS` | `50` | 单个网页会话提问上限，`0` 不限 | 公开部署时调小 |
+| `AGENT_LOG_DIR` | `output/logs` | 运行日志目录 | 容器里要挂载日志卷时 |
+
+> 改完可以用 `python -m app.cli schema` 或随便问一句确认生效；
+> `tests/test_deploy.py` 会盯着配置读取的优先级（环境变量 → `.env` → `st.secrets`）。
 
 ## 测试
 
