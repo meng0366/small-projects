@@ -46,6 +46,7 @@ from app.tools.chart_tool import build_chart, save_chart
 from app.tools.attribution import attribution_chart_frame, decompose
 from app.tools.enum_guard import build_clarify_answer
 from app.tools.lesson_store import select_lessons
+from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
@@ -80,28 +81,48 @@ def make_generate_node(ctx: AgentContext):
         # 计划先行（P1）：计划已通过代码校验，拼在问题后面一起下发。
         # 重试时**沿用同一份计划** —— 空结果重试不许改口径，计划正是那条口径。
         plan_hint = state.get("plan_hint") or ""
-        try:
+        if not ctx.use_peek:
+            # 关掉探查时靠"紧贴问题的指令"拦住模型，而不是事后丢弃它的 PEEK 行：
+            # 后者会让模型白要一次、我们再干耗一次调用重新生成。
+            plan_hint = (plan_hint + "\n\n" + PEEK_OFF_NOTE).strip()
+
+        def _generate(hint: str = plan_hint) -> str:
             if intent and route == "sql":
                 # 归因问题要的不是"一个总数"，而是能拆的交叉表（P1-2）
-                statement = generate_attribution_sql(
+                return generate_attribution_sql(
                     state.get("schema_info", ""), state.get("terms", ""), question, intent,
                     previous_error=previous_error, previous_empty=previous_empty,
-                    lessons=lessons, plan_hint=plan_hint)
-            elif route == "sql":
-                statement = generate_sql(state.get("schema_info", ""), state.get("terms", ""),
-                                         question, previous_error=previous_error,
-                                         previous_empty=previous_empty, lessons=lessons,
-                                         plan_hint=plan_hint)
-            else:
-                statement = generate_code(state.get("schema_info", ""), state.get("terms", ""),
-                                          question, previous_error=previous_error,
-                                          previous_empty=previous_empty, lessons=lessons,
-                                          plan_hint=plan_hint)
+                    lessons=lessons, plan_hint=hint)
+            if route == "sql":
+                return generate_sql(state.get("schema_info", ""), state.get("terms", ""),
+                                    question, previous_error=previous_error,
+                                    previous_empty=previous_empty, lessons=lessons,
+                                    plan_hint=hint)
+            return generate_code(state.get("schema_info", ""), state.get("terms", ""),
+                                 question, previous_error=previous_error,
+                                 previous_empty=previous_empty, lessons=lessons,
+                                 plan_hint=hint)
+
+        try:
+            statement = _generate()
         except Exception as e:
             return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}",
                     "lessons_used": used}
 
-        return {"statement": statement, "lessons_used": used}
+        # 两段式探查（P1）：模型若先要"看一眼真实取值"，这里执行一次并把结果回灌，
+        # 再让它写最终 SQL。额度按整次问答算（`peek_used` 进 state），重试时不再探。
+        statement, peek_update = maybe_peek(
+            ctx, statement,
+            lambda note: _generate((plan_hint + "\n\n" + note).strip() if plan_hint else note),
+            trace_id=state.get("trace_id", ""),
+            remaining=0 if state.get("peek_used") else MAX_PEEKS)
+
+        update = {**peek_update, "statement": statement, "lessons_used": used}
+        if not statement:
+            # 探查后重新生成失败：交给重试环，绝不能把 `PEEK:` 那行当 SQL 去执行
+            update["error"] = (peek_update.get("peek_error")
+                               or "生成失败：没有拿到可执行语句")
+        return update
 
     return node
 
@@ -512,6 +533,9 @@ class GraphAgent:
             attribution=bool((state.get("attribution") or {}).get("ok")),
             plan=state.get("plan_reason", ""),
             plan_issues=len(state.get("plan_issues") or []),
+            peek_used=bool(state.get("peek_used")),
+            peek_rows=int(state.get("peek_rows") or 0),
+            peek_error=(state.get("peek_error") or "")[:80],
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),

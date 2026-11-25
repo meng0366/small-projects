@@ -29,6 +29,7 @@ from app.nodes.reflect import is_aggregate_empty, is_empty_result
 from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
 from app.tools.enum_guard import build_clarify_answer
+from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.time_anchor import format_time_hint, out_of_range_answer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
@@ -48,6 +49,7 @@ class AskResult:
     trace_id: str = ""              # 本次问答的追踪号（P2-2），阶段事件与汇总行共用
     plan: Optional[dict] = None     # 结构化查询计划（P1），None 表示这次没出计划
     plan_issues: List[dict] = field(default_factory=list)
+    peek: dict = field(default_factory=dict)   # 两段式探查（P1）：used/rows/note/error/ms
     errors: List[str] = field(default_factory=list)
     refuse_reason: str = ""         # 理解阶段直接拒答的原因（P0 时间锚点），无生成无执行
 
@@ -137,6 +139,11 @@ class DataAgent:
             "plan": res.plan,
             "plan_issues": list(res.plan_issues),
             "plan_used": bool(res.plan),
+            "peek_used": bool(res.peek.get("peek_used")),
+            "peek_note": res.peek.get("peek_note", ""),
+            "peek_rows": int(res.peek.get("peek_rows") or 0),
+            "peek_error": res.peek.get("peek_error", ""),
+            "peek_ms": int(res.peek.get("peek_ms") or 0),
             "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
             "insight": res.refuse_reason or res.insight,
             "suggestions": [],
@@ -247,6 +254,11 @@ class DataAgent:
             rows=0 if res.df is None else int(len(res.df)),
             empty=is_empty_result(res.df) or is_aggregate_empty(res.df),
             chart=res.chart_type,
+            plan=plan_update.get("plan_reason", ""),
+            plan_issues=len(res.plan_issues),
+            peek_used=bool(res.peek.get("peek_used")),
+            peek_rows=int(res.peek.get("peek_rows") or 0),
+            peek_error=(res.peek.get("peek_error") or "")[:80],
             elapsed=round(time.perf_counter() - started, 2),
             question=(question or "")[:200],
             question_len=len(question or ""),
@@ -258,10 +270,18 @@ class DataAgent:
     def _try_sql(self, question: str, res: AskResult, terms: str = None,
                  plan_hint: str = "") -> None:
         trace = res.trace_id
+        hint = plan_hint
+        if not self.ctx.use_peek:
+            hint = (hint + "\n\n" + PEEK_OFF_NOTE).strip()
+
+        def _generate(extra: str = "") -> str:
+            merged = (hint + "\n\n" + extra).strip() if hint else extra
+            return generate_sql(self.db_schema, terms or self.terms, question,
+                                plan_hint=merged)
+
         started = time.perf_counter()
         try:
-            sql = generate_sql(self.db_schema, terms or self.terms, question,
-                               plan_hint=plan_hint)
+            sql = _generate()
         except Exception as e:
             msg = f"SQL 生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)
@@ -269,10 +289,24 @@ class DataAgent:
                       ms=round((time.perf_counter() - started) * 1000),
                       **trace_fields({"route": "sql", "error": msg}, failed=True))
             return
+
+        # 两段式探查（P1）：与状态机共用 maybe_peek，流程只有一份实现
+        sql, peek_update = maybe_peek(self.ctx, sql, lambda note: _generate(note),
+                                      trace_id=trace, remaining=MAX_PEEKS)
+        res.peek = peek_update
+        if not sql:
+            msg = peek_update.get("peek_error") or "生成失败：没有拿到可执行语句"
+            res.errors.append(msg)
+            log_event(trace, "generate",
+                      ms=round((time.perf_counter() - started) * 1000),
+                      **trace_fields({"route": "sql", "error": msg, **peek_update},
+                                     failed=True))
+            return
+
         # 语句原文不落盘，只记长度 —— 白名单在 logging_utils 里统一管这件事
         log_event(trace, "generate",
                   ms=round((time.perf_counter() - started) * 1000),
-                  **trace_fields({"route": "sql", "statement": sql}))
+                  **trace_fields({"route": "sql", "statement": sql, **peek_update}))
 
         started = time.perf_counter()
         r = run_sql(sql, self.db_path)

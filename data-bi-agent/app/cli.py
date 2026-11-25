@@ -65,7 +65,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 """与项目阶段对齐：0.9 = 第九轮调研的守卫与归因增强；0.10 = 计划先行（P1）。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
@@ -103,6 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-insight", action="store_true", help="不生成洞察文案（省一次模型调用）")
         p.add_argument("--no-plan", action="store_true",
                        help="不先出查询计划（省一次模型调用；计划用于提前发现理解错误）")
+        p.add_argument("--no-peek", action="store_true",
+                       help="不允许两段式探查（模型不确定取值时先看一眼真实数据）")
         p.add_argument("--linear", action="store_true", help="用线性编排（无重试、无多轮记忆）")
         p.add_argument("--pandas", action="store_true", help="线性模式下强制走单表 pandas")
 
@@ -174,7 +176,8 @@ def make_context(args) -> AgentContext:
     """按 `--db` 构造数据上下文。"""
     db_file = getattr(args, "db", None)
     use_plan = not getattr(args, "no_plan", False)
-    return AgentContext(db_file=db_file, use_plan=use_plan)
+    use_peek = not getattr(args, "no_peek", False)
+    return AgentContext(db_file=db_file, use_plan=use_plan, use_peek=use_peek)
 
 
 def build_agent(args):
@@ -258,6 +261,16 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
             elif issue.get("level") == "warn" and issue.get("kind") in ("table", "column"):
                 print(f"  · 注意：{issue.get('message')}")
 
+    # 两段式探查（P1）：只在这轮真的探查过时出现 —— 它说明"模型对某个取值没把握，
+    # 先看了真实数据再写 SQL"，用户能据此判断这个数字的可靠性。
+    if state.get("peek_used"):
+        peek_note = state.get("peek_note") or ""
+        peek_error = state.get("peek_error") or ""
+        if peek_note:
+            print(f"\n[探查] {peek_note}")
+        elif peek_error:
+            print(f"\n[探查] 未成功：{peek_error}")
+
     statement = state.get("statement") or ""
     if statement and not quiet:
         label = "SQL" if route == "sql" else "代码"
@@ -337,6 +350,12 @@ def _build_payload(state: dict, question: str) -> dict:
             "reason": state.get("plan_reason") or "",
             "content": state.get("plan"),
             "issues": state.get("plan_issues") or [],
+        },
+        "peek": {
+            "used": bool(state.get("peek_used")),
+            "rows": int(state.get("peek_rows") or 0),
+            "note": state.get("peek_note") or "",
+            "error": state.get("peek_error") or "",
         },
         "ok": df is not None,
         "route": state.get("route") or "",

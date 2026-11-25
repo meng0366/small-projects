@@ -123,6 +123,12 @@ TRACE_FIELDS = (
     ("plan_reason", "plan", lambda v: str(v or "")[:40]),
     ("plan_issues", "plan_issues", len),
     ("time_defer", "time_defer", bool),
+    # 两段式探查（P1）：`peek_note` 故意不进白名单 —— 里面是库里真实的取值，
+    # 属于数据而不是"过程标量"，只记行数与是否发生就够回答"这次多花了多少"
+    ("peek_used", "peek", bool),
+    ("peek_rows", "peek_rows", int),
+    ("peek_ms", "peek_ms", int),
+    ("peek_error", "peek_error", lambda v: str(v or "")[:80]),
     ("chart_type", "chart", str),
     ("lessons_used", "lessons", len),
     ("errors", "errors", len),

@@ -99,6 +99,12 @@ def render_sidebar(ctx: AgentContext) -> tuple:
             "先出查询计划（多一次模型调用）", value=ctx.use_plan,
             help="生成 SQL 前先让模型写出指标/表/维度/过滤/时间，由代码校验表列是否存在、"
                  "时间是否有数据、取值是否真实。能拦住「理解错但数字看着对」的情况。")
+        # 探查只在模型自己觉得"取值没把握"时才花一次调用，所以默认开着；
+        # 想完全复现旧行为（或想知道没有探查时是什么表现）可以关掉。
+        ctx.use_peek = st.toggle(
+            "允许先看一眼真实取值（两段式探查）", value=ctx.use_peek,
+            help="模型对某列的取值没把握时，可以先只读地看一眼真实数据再写 SQL，"
+                 "避免把「已完成」猜成「completed」这种猜错字面量的情况。")
 
         st.divider()
         st.subheader("示例问题")
@@ -144,6 +150,9 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "attribution": state.get("attribution") or {},
         "plan": state.get("plan") or {},
         "plan_issues": state.get("plan_issues") or [],
+        "peek_used": bool(state.get("peek_used")),
+        "peek_note": state.get("peek_note") or "",
+        "peek_error": state.get("peek_error") or "",
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -208,6 +217,15 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
                 st.json(msg["plan"])
                 for text in assumptions:
                     st.caption(f"假设：{text}")
+
+        # 两段式探查（P1）：只在真的探查过时显示。它说明"这个数是在看过真实取值之后算的"，
+        # 这正是它比"模型猜对了"更值得让用户知道的地方。
+        if msg.get("peek_used"):
+            note = msg.get("peek_note") or ""
+            if note:
+                st.caption(f"探查：{note}")
+            elif msg.get("peek_error"):
+                st.caption(f"探查未成功：{msg['peek_error']}")
 
         if att.get("ok"):
             st.caption(f"归因明细：「{att.get('current_label')}」对比"

@@ -38,6 +38,7 @@ class AgentContext:
     db_file: Optional[str] = None    # 命令行 `--db` 指定的库文件，优先于 data/ 下的默认库
     use_lessons: bool = True         # 是否加载修正回流（few-shot）；评测基线用 False 保证可比
     use_plan: bool = True            # 是否先出查询计划（P1）；计划会多一次模型调用，可关掉省钱
+    use_peek: bool = True            # 是否允许两段式探查（P1）；只在模型不确定取值时才多一次调用
 
     @cached_property
     def db_path(self) -> Optional[str]:

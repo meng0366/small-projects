@@ -44,6 +44,13 @@ class AgentState(TypedDict, total=False):
     lessons_used: List[str]          # 本次注入了哪几条修正记录（P1-1，便于排查"为什么这次答对了"）
     result: Any                      # 执行结果（DataFrame）
 
+    # ---- 两段式探查（P1，2026-11-25）----
+    peek_used: bool                  # 模型是否要求过探查（要求了就算用掉额度，不管成没成）
+    peek_note: str                   # 探查结果的一行摘要，给用户看"系统先看了一眼什么"
+    peek_rows: int                   # 探查取回的行数
+    peek_error: str                  # 探查被拒或执行失败的原因
+    peek_ms: int                     # 探查 + 重新生成的耗时（毫秒），记在 generate 事件里
+
     # ---- 错误与重试 ----
     error: str                       # 最近一次错误
     errors: List[str]                # 历史错误（供反思与排查）
