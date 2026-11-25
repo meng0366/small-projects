@@ -569,6 +569,8 @@ tests/
 └── test_cli.py          # 命令行与新模块测试（55 个用例，全离线）
 CHANGELOG.md             # 变更说明（面向协作方：改了什么、行为差异、同步清单）
 LICENSE                  # MIT（版权人 雷佳山）
+.env.example             # 密钥模板（复制成 .env 再填，.env 本身永不上传）
+.dockerignore            # 构建镜像时排除 .env / 测试 / 本地文档
 requirements.txt         # 运行依赖
 requirements.lock.txt    # 锁版本依赖（要与我们完全一致的环境时用）
 requirements-mcp.txt     # 可选依赖：只有在 `serve` 跑 MCP server 时才需要
