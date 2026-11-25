@@ -1,0 +1,14 @@
+# MCP server 的可选依赖（0.13.0+）
+#
+# 作用：把 ask / get_schema / generate_catalog 暴露成 MCP 工具，
+#       供 Claude Desktop、IDE、其他 Agent 直接调用。
+# 用法：pip install -r requirements-mcp.txt
+#       然后 python -m app.cli serve
+#
+# 为什么单独一份：MCP 只有在"要被别的程序调用"时才需要，它拖着
+# cryptography / pywin32 等一串依赖。只想用命令行或网页的人不必装。
+#
+# 版本：mcp 1.x（FastMCP）与 2.x（改名 MCPServer）都支持，
+#       app/mcp_server.py 里有一层取类的薄兼容，这里不锁大版本。
+-r requirements.txt
+mcp>=1.9

@@ -5,7 +5,11 @@ name: 离线测试
 # 设计原则：
 # 1. 全部用例不调用大模型 —— CI 里刻意不注入任何密钥，既省成本，
 #    也能证明代码没有偷偷联网；
-# 2. 按 README 写的方式安装依赖（requirements.txt），验证"别人 clone 下来能跑"；
+# 2. 按 README 写的方式安装依赖，验证"别人 clone 下来能跑"。
+#    这里两条都装：requirements-mcp.txt 在 requirements.txt 之上加一个 mcp。
+#    MCP 本身是可选能力（不装也能全绿，相关用例会 skip），但既然要发布，
+#    就应该在 CI 里真的测到"工具能注册上协议层"——docker 作业没装 mcp，
+#    那边会自然 skip，等于两个作业分别覆盖"有 mcp"和"没 mcp"两种环境；
 # 3. 额外构建一次 Docker 镜像并在镜像里跑同一套测试，覆盖"镜像只是写了没实测"的缺口。
 
 on:
@@ -49,12 +53,14 @@ jobs:
           cache: pip
           cache-dependency-path: |
             data-bi-agent/requirements.txt
+            data-bi-agent/requirements-mcp.txt
             data-bi-agent/requirements.lock.txt
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          # -r requirements.txt 已在文件内包含；这里是为装到可选依赖 mcp
+          python -m pip install -r requirements-mcp.txt
 
       - name: 确认环境里没有密钥
         # 仓库是公开的，一旦有人误把 .env 提交上来，这一步会直接拦下。

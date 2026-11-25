@@ -3,6 +3,90 @@
 面向协作方的同步文档：这次改了什么、行为和以前哪里不一样、需要做什么。
 按版本倒序排列。版本号与 `python -m app.cli version` 一致。
 
+## 0.13.0 — 2026-11-26
+
+**一句话**：这个 Agent 现在可以被别的 Agent 直接调用了 —— `python -m app.cli serve`
+把它变成一个 MCP server，`ask` / `get_schema` / `generate_catalog` 三个工具对外。
+
+### 一、用户能感受到的变化
+
+- 装可选依赖、启动：
+
+  ```bash
+  pip install -r requirements-mcp.txt        # 在 requirements.txt 之上加一个 mcp
+  python -m app.cli serve                    # stdio，默认用 data/sales.db
+  python -m app.cli serve --db 我的库.db      # 换默认库
+  ```
+
+  在 Claude Desktop 的 `claude_desktop_config.json` 里配：
+
+  ```json
+  {
+    "mcpServers": {
+      "data-bi-agent": {
+        "command": "D:/path/.venv/Scripts/python.exe",
+        "args": ["-m", "app.cli", "serve", "--db", "D:/path/data/sales.db"],
+        "cwd": "D:/path/data-bi-agent"
+      }
+    }
+  }
+  ```
+
+- 三个工具：
+
+  | 工具 | 干什么 | 对应命令 |
+  | --- | --- | --- |
+  | `ask` | 中文提问，返回数据 + 生成的 SQL + 执行信息 | `ask -f json` |
+  | `get_schema` | 表/列（含中文名）、指标口径、表关系 | `schema --json` |
+  | `generate_catalog` | 给陌生的库生成词典草稿（会写文件） | `catalog` |
+
+- 返回的是 JSON，与 `ask -f json` **同一份结构**（同一份代码），所以脚本里怎么读，
+  这里就怎么读。数据默认只给前 200 行，并写明 `truncated` 与真实的 `rows`。
+
+### 二、行为和以前哪里不一样
+
+- **没有变化**：命令行、网页、评测口径全都不动。53 条评测仍是 53/53、63 次调用、
+  token 持平（179,065），因为这一版没碰任何提示词。
+- 唯一的内部调整：`-f json` 的 payload 构造从 `app/cli.py` 挪到 `app/payload.py`，
+  让 MCP 工具与命令行读同一份 —— 否则两边字段名各自演化，第一个踩坑的是读 JSON 的脚本。
+
+### 三、几个刻意这么定的地方
+
+| 选择 | 为什么 |
+| --- | --- |
+| stdio 下一行 print 都没有 | stdout 是 JSON-RPC 通道，混一行提示客户端就连不上。CLI 那套带 print 的 `run_*` 一个都不复用，只复用不打印的那层 |
+| 数据截断到 200 行且标注 | 返回值进的是另一个模型的上下文窗口。悄悄只给一部分，比截断本身危险 |
+| 错误返回 `{"ok": false, "error": ...}` 而不抛异常 | 对面看到 traceback 只会说"工具坏了"，看到结构化错误才会换问法或去告诉用户 |
+| `insight` / `chart` 默认关 | 一个多花 token，一个写图片文件——MCP 场景下调用方要的是数字 |
+| mcp 放可选依赖 | 它拖着 cryptography、pywin32 一串东西；只用命令行或网页的人不必装 |
+| 没装 mcp 时测试 skip 而不是 fail | clone 下来默认环境应当全绿；CI 里装了 mcp，所以注册层在 CI 被真的测到 |
+
+### 四、怎么验证的
+
+- 离线用例 493 → **526**（新增 `tests/test_mcp_server.py` 33 个）。
+- 未装 mcp 的环境：33 个用例里 5 个 skip（需要协议层的那些）、28 个照跑，全绿。
+  这是"clone 下来不装可选依赖也能跑测试"的保证。
+- 真实 stdio 握手（起子进程走 JSON-RPC）：
+  ```
+  initialize -> capabilities / instructions 正常返回
+  tools/list -> ['ask', 'get_schema', 'generate_catalog']
+  get_schema -> 返回 3 张表的结构
+  ask("各区域的销售额是多少？", max_rows=3)
+      -> ok=true · route=sql · rows=5 · truncated=true · data 长度 3
+      -> trace_id 20261126-002002-900001
+  stderr 空、退出码 0
+  ```
+- 评测 53/53 不变。
+
+### 五、已知边界
+
+- **只支持 stdio**。HTTP 传输（streamable-http）要按客户端的部署方式配，
+  各版本 mcp SDK 的启动参数还不统一，这一版不做，避免写一段"本地跑得通、
+  换台机器就不行"的代码。
+- 一次 `ask` 就是一次完整问答（含计划/探查/重试），**耗时 2 秒起**，
+  客户端要有耐心；它不适合"一次问 50 个问题"的批处理场景，那种场景请用命令行。
+- 没有鉴权概念：stdio 是本地进程，谁起进程谁就是这个用户。别把它包到公网端口上。
+
 ## 0.12.0 — 2026-11-26
 
 **一句话**：接一个新库不用再手抄 `catalog.yaml` —— 一条命令把表结构、样例值、枚举取值、

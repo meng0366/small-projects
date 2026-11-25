@@ -40,6 +40,7 @@ from app.config import LLM_MODEL
 from app.context import AgentContext
 from app.graph import GraphAgent
 from app.logging_utils import log_path, read_events, read_runs
+from app.payload import build_payload, schema_payload
 from app.render import (
     SUPPORTED_FORMATS,
     UnsupportedFormat,
@@ -80,11 +81,13 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.12.0"
-"""与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成。"""
+VERSION = "0.13.0"
+"""与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成；
+0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
-               "teach", "t", "lessons", "ls", "catalog", "cat", "version", "help")
+               "teach", "t", "lessons", "ls", "catalog", "cat",
+               "serve", "version", "help")
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
 ROUTE_LABEL = {
@@ -109,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python -m app.cli logs -n 5 --failed\n"
             "  python -m app.cli teach \"各城市的销售额是多少？\" --sql \"SELECT ...\"\n"
             "  python -m app.cli catalog --db 我的库.db --dry-run\n"
+            "  python -m app.cli serve            # 以 MCP server 启动，给 Claude Desktop / IDE 用\n"
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -184,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_cmd.add_argument("--merge", metavar="PATH",
                              help="与已有词典合并：已有的非空内容一律保留，只补空缺")
     catalog_cmd.add_argument("--json", action="store_true", help="以 JSON 输出（不写文件）")
+
+    serve_cmd = sub.add_parser(
+        "serve", help="以 MCP server 形态启动（stdio），供别的 Agent 直接调用")
+    serve_cmd.add_argument("--db", metavar="PATH",
+                           help="默认库文件；MCP 工具的参数里仍可逐次覆盖")
+    serve_cmd.add_argument("--name", default="", metavar="NAME",
+                           help="服务器名（默认 data-bi-agent）")
 
     sub.add_parser("version", help="显示版本与当前数据源")
 
@@ -344,61 +355,12 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
 
 
 def _build_payload(state: dict, question: str) -> dict:
-    """`-f json` 的结构化输出：脚本里最需要的是语句、数据、指标，而不是排版。"""
-    df = state.get("result")
-    att = state.get("attribution") or {}
-    attribution = None
-    if att.get("ok"):
-        attribution = {
-            "compare": {"base": att.get("base_label"), "current": att.get("current_label")},
-            "dimension": att.get("dim"),
-            "metric": att.get("metric"),
-            "base_total": att.get("base_total"),
-            "current_total": att.get("current_total"),
-            "delta": att.get("delta"),
-            "pct": att.get("pct"),
-            "additive": att.get("additive"),
-            "rows": json.loads(render(att["table"], "json")),
-            "notes": att.get("notes") or [],
-        }
-        drill = att.get("drill")
-        if drill:
-            attribution["drill"] = {
-                "dimension": drill.get("dim"),
-                "item": drill.get("item"),
-                "item_delta": drill.get("item_delta"),
-                "closure_ok": drill.get("closure_ok"),
-                "rows": json.loads(render(drill["table"], "json")),
-            }
-    return {
-        "question": question,
-        "rewritten": state.get("rewritten_question") or "",
-        "trace_id": state.get("trace_id") or "",
-        "plan": {
-            "used": bool(state.get("plan")),
-            "reason": state.get("plan_reason") or "",
-            "content": state.get("plan"),
-            "issues": state.get("plan_issues") or [],
-        },
-        "peek": {
-            "used": bool(state.get("peek_used")),
-            "rows": int(state.get("peek_rows") or 0),
-            "note": state.get("peek_note") or "",
-            "error": state.get("peek_error") or "",
-        },
-        "ok": df is not None,
-        "route": state.get("route") or "",
-        "statement": state.get("statement") or "",
-        "columns": [] if df is None else [str(c) for c in df.columns],
-        "rows": 0 if df is None else int(len(df)),
-        "data": [] if df is None else json.loads(render(df, "json")),
-        "attribution": attribution,
-        "insight": state.get("insight") or "",
-        "suggestions": state.get("suggestions") or [],
-        "retries": int(state.get("retry_count") or 0),
-        "errors": state.get("errors") or [],
-        "elapsed": state.get("_elapsed"),
-    }
+    """命令行 `-f json` 的结构化输出。
+
+    实现在 `app/payload.py` —— MCP 工具返回的是同一份结构，两边各写一份必然漂移。
+    命令行不截断（用户自己要看全量），截断只在 MCP 侧按 `max_rows` 做。
+    """
+    return build_payload(state, question)
 
 
 def output_result(args, state: dict, question: str) -> int:
@@ -572,49 +534,11 @@ def run_chat(args) -> int:
         ])[-8:]   # 最近 4 轮，控制 token
 
 
-def _db_columns(db_path: str) -> dict:
-    """读取每张表的字段名与行数（只读连接，仅用于展示）。"""
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        result = {}
-        for name in list_tables(db_path):
-            rows = con.execute(f'PRAGMA table_info("{name}")').fetchall()
-            count = con.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
-            result[name] = {"columns": [r[1] for r in rows], "rows": count}
-        return result
-    finally:
-        con.close()
-
-
 def run_schema(args) -> int:
     ctx = make_context(args)
-    catalog = load_catalog()
-    labels = {}
-    for table in catalog.get("tables") or []:
-        for column, meta in (table.get("columns") or {}).items():
-            if isinstance(meta, dict) and meta.get("label"):
-                labels[f"{table.get('name')}.{column}"] = meta["label"]
-
-    tables = []
-    if ctx.has_db:
-        info = _db_columns(ctx.db_path)
-        for name, meta in info.items():
-            tables.append({
-                "name": name,
-                "rows": meta["rows"],
-                "columns": [
-                    {"name": col, "label": labels.get(f"{name}.{col}", "")}
-                    for col in meta["columns"]
-                ],
-            })
-
-    payload = {
-        "mode": ctx.mode_label,
-        "db": ctx.db_path,
-        "tables": tables,
-        "terms": catalog.get("terms") or {},
-        "relationships": catalog.get("relationships") or [],
-    }
+    # 与 MCP 的 `get_schema` 共用同一份 payload，避免两处字段名各自演化
+    payload = schema_payload(ctx)
+    tables = payload["tables"]
 
     if getattr(args, "json", False):
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -932,12 +856,28 @@ def run_catalog(args) -> int:
     return EXIT_OK
 
 
+def run_serve(args) -> int:
+    """以 MCP server 形态启动（stdio）。
+
+    **这里不能 print 任何东西**：stdio 传输下 stdout 归 JSON-RPC 协议所有，
+    多一行提示就握手失败。需要提示时一律走 stderr。
+    延迟导入也是刻意的 —— mcp 是可选依赖，不能让其他命令因为没装它而 import 失败。
+    """
+    try:
+        from app.mcp_server import SERVER_NAME, serve
+    except ModuleNotFoundError as e:
+        print(f"[启动失败] {e}", file=sys.stderr)
+        return EXIT_FAILED
+    return serve(db=getattr(args, "db", "") or "",
+                 name=getattr(args, "name", "") or SERVER_NAME)
+
+
 def run_version() -> int:
     ctx = AgentContext()
     print(f"数据分析 Agent v{VERSION}")
     print(f"模型：{LLM_MODEL}")
     print(f"数据源：{ctx.mode_label}")
-    print("命令：ask / chat / schema / logs / teach / lessons / catalog / version"
+    print("命令：ask / chat / schema / logs / teach / lessons / catalog / serve / version"
           "（-h 查看用法）")
     return EXIT_OK
 
@@ -967,6 +907,9 @@ def main(argv: Optional[list] = None) -> int:
         return run_teach(args)
     if command in ("lessons", "ls"):
         return run_lessons(args)
+
+    if command == "serve":
+        return run_serve(args)
     if command in ("catalog", "cat"):
         return run_catalog(args)
     if command == "version":

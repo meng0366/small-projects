@@ -16,7 +16,7 @@
 | 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ✅ |
 | 6 | 命令行增强（子命令 / 子命令输出格式 / 会话续聊 / 追问建议） | ✅ |
-| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 相对时间锚点 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ 持续集成（GitHub Actions）/ 链路追踪（trace_id）/ 计划先行（先出计划再写 SQL）/ 两段式探查（先看一眼真实取值）/ **词典自动生成（接新库不用手抄 catalog）** | ✅ |
+| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 相对时间锚点 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ 持续集成（GitHub Actions）/ 链路追踪（trace_id）/ 计划先行（先出计划再写 SQL）/ 两段式探查（先看一眼真实取值）/ 词典自动生成（接新库不用手抄 catalog）/ **MCP server（供别的 Agent 直接调用）** | ✅ |
 
 ## 环境要求
 
@@ -56,6 +56,15 @@ pip install -r requirements.txt
 ```
 
 > 需要与我们完全一致的版本时，可用 `pip install -r requirements.lock.txt`。
+
+只想让别的程序（Claude Desktop / IDE / 其他 Agent）调用它时，再装 MCP 那部分依赖：
+
+```bash
+pip install -r requirements-mcp.txt      # 在 requirements.txt 之上加 mcp
+```
+
+> 它不在主依赖里，是因为 mcp 会拖着 cryptography、pywin32 一串东西。
+> 只用命令行或网页的人不必装。
 
 ### 4. 配置 API Key
 
@@ -331,6 +340,75 @@ AGENT_CATALOG=我的词典.yaml python -m app.cli ask "各渠道的销售额是�
 两点注意：**只支持 SQLite**；列的中文名由模型提议，**口径名要自己过一眼** ——
 模型写「销售金额」而你同事都问「销售额」，这个口径就命中不了（草稿注释里也写了这句）。
 
+### serve：作为 MCP server 被别的 Agent 调用
+
+前面所有用法都是"人问、机器答"。但数据分析最常见的调用方其实是**另一个 Agent** ——
+写周报的 Agent 想知道本月销售额，它不该自己写 SQL，也不该让人复制粘贴。
+`serve` 把三件事暴露成 MCP 工具：
+
+```bash
+pip install -r requirements-mcp.txt
+python -m app.cli serve                              # stdio，默认用 data/sales.db
+python -m app.cli serve --db D:/data/我的库.db        # 指定默认库
+```
+
+在 Claude Desktop 的 `claude_desktop_config.json` 里加一段（路径换成你自己的）：
+
+```json
+{
+  "mcpServers": {
+    "data-bi-agent": {
+      "command": "D:/agent/small-projects/data-bi-agent/.venv/Scripts/python.exe",
+      "args": ["-m", "app.cli", "serve", "--db", "D:/agent/small-projects/data-bi-agent/data/sales.db"],
+      "cwd": "D:/agent/small-projects/data-bi-agent"
+    }
+  }
+}
+```
+
+`cwd` 别省 —— `-m app.cli` 要靠它找到包，否则客户端只会报"服务器启动失败"。
+
+| 工具 | 干什么 | 对应命令 |
+| --- | --- | --- |
+| `ask` | 用中文问一个数据问题，返回结果数据 + 生成的 SQL + 执行信息 | `ask -f json` |
+| `get_schema` | 看有哪些表/列（含中文名）、指标口径、表关系 | `schema --json` |
+| `generate_catalog` | 给陌生的库生成词典草稿（**会写文件**，需人工确认） | `catalog` |
+
+`ask` 的参数：`question`（必填）、`db`、`plan` / `peek`（默认开，两项自检）、
+`insight` / `chart`（默认关，一个多花 token 一个写图片文件）、`linear`、
+`max_rows`（默认 200）。
+
+返回长这样（截断处能看到 `truncated`）：
+
+```json
+{
+  "ok": true,
+  "route": "sql",
+  "statement": "SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 ...",
+  "columns": ["区域", "销售额"],
+  "rows": 5,
+  "truncated": false,
+  "data": [{"区域": "华东", "销售额": 2345678.9}],
+  "plan": {"used": true, "content": {"metric": "SUM(amount)", "dimensions": ["region"]}},
+  "trace_id": "20261126-002002-900001"
+}
+```
+
+三个刻意的设计，都是踩过才想清楚的：
+
+| 选择 | 为什么 |
+| --- | --- |
+| **stdio 下一行 print 都没有** | stdout 是 JSON-RPC 通道，混一行"正在启动"客户端就连不上。所以工具只返回字符串，不带任何业务打印（CLI 那套 `run_*` 一个都不能直接调） |
+| **数据默认截断到 200 行，并写明 `truncated` / `rows`** | 返回值进的是另一个模型的上下文。悄悄只给一部分，比明说截断危险得多 |
+| **出错返回 `{"ok": false, "error": "..."}` 而不是抛异常** | 对面看到一屏 traceback 只会说"工具坏了"；看到结构化错误才会换个问法，或者去告诉用户原因 |
+
+只读：`ask` 走的是同一套只读库 + SQL 安全校验，不会改你的数据。
+唯一有写操作的是 `generate_catalog`，它只写 `catalog.draft.yaml`，绝不覆盖
+`app/schema/catalog.yaml`；`dry_run=true` 时连模型都不调。
+
+想关掉某次调用的自检省钱：`plan=false` / `peek=false`；
+`--no-plan` / `--no-peek` 那两个命令行参数对 MCP 无效（工具参数优先）。
+
 ### 公共参数
 
 | 参数 | 作用 | 适用 |
@@ -401,7 +479,9 @@ app/
 ├── graph.py             # LangGraph 状态机（含重试环）+ 运行日志
 ├── logging_utils.py     # 运行日志、token 计数与 trace_id 链路追踪（阶段事件 + 汇总行）
 ├── agent.py             # 线性编排（--linear 时使用，也写阶段日志）
-├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / version）
+├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / catalog / serve）
+├── payload.py           # 结构化输出：CLI 的 -f json 与 MCP 工具共用同一份 payload
+├── mcp_server.py        # MCP server：把 ask / get_schema / generate_catalog 暴露给别的 Agent
 ├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
 ├── sessions.py          # 会话持久化（~/.data-agent/sessions，支持 chat -c 续聊）
 ├── main.py              # Streamlit 网页界面（聊天式问答）
@@ -450,6 +530,7 @@ tests/
 ├── test_plan.py         # 计划先行测试（38 个用例：触发判定、JSON 解析、表/列/时间/取值校验、两引擎）
 ├── test_peek.py         # 两段式探查测试（55 个用例：前缀解析、白名单正反例、回灌格式、额度、两引擎）
 ├── test_catalog_gen.py  # 词典自动生成测试（48 个用例：类型映射、枚举判据、外键推断、YAML 往返、激活 enum_guard）
+├── test_mcp_server.py   # MCP 测试（33 个用例：工具注册与参数 schema、截断标注、错误结构化、stdout 洁净、未装 mcp 的提示）
 ├── test_ui.py           # 网页界面测试（8 个用例，全 mock LLM）
 ├── test_eval.py         # 评测集与判分测试（34 个用例，含 refuse/clarify）
 ├── test_security.py     # 安全防护测试（16 个用例）
@@ -667,7 +748,7 @@ execute：SQL 走只读库 / 代码走受限命名空间
 python -m unittest discover -s tests -v
 ```
 
-共 493 个用例，覆盖：
+共 526 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -684,6 +765,7 @@ python -m unittest discover -s tests -v
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
 | `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、`logs --trace` 参数、追问建议、退出码 |
 | `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、状态机的重试环与澄清分支、线性路线的顺利/回退/全失败三条链、节点异常留痕、字段白名单（只记长度/行数、零值不写、未知键丢弃）、CLI 链路输出 |
+| `tests/test_mcp_server.py` | MCP 工具注册与参数 schema（默认值要落在省 token 那一档）、`ask` 的开关映射（`plan=False` 真的落成 `--no-plan`）、截断标注（`rows` 是真实总数、`data` 只有 N 行、`truncated` 为真）、中文不转义、空问题/库不存在/模型异常的三种结构化错误、`dry_run` 绝不调模型、草稿落到库文件同目录且能被 `yaml.safe_load` 读回、**工具调用期间 stdout 必须为空**（stdio 协议通道）、未装 mcp 时的提示语、`serve --db/--name` 真的传下去 |
 | `tests/test_catalog_gen.py` | 词典自动生成：类型映射（含"TEXT 存日期"与"没声明类型"）、枚举四条判据与标识符排除（回归 `customer_id` 误认）、外键声明与推断、脏 JSON 解析、不存在的表列被丢弃、三方合并优先级（已有 > 模型 > 实测，事实除外）、YAML 往返与特殊字符转义、参数超长拒绝、草稿喂给 `build_db_schema_text`、草稿激活 `enum_guard` |
 | `tests/test_peek.py` | 两段式探查：`PEEK:` 前缀（含全角冒号、大小写、二次探查）、白名单正反例（单表/纯列名放行，JOIN/UNION/子查询/聚合/`*`/多表/多语句全拒）、单列压成取值清单与多列按行回灌、空值与超长值、额度用完与死循环、探查失败原因回灌、两引擎端到端 |
 | `tests/test_plan.py` | 计划先行：何时才出计划（过滤语义/比率指标/长问题触发，简单聚合与并列问法不触发）、从模型输出里抠 JSON（代码块、前后废话、多个花括号）、表名与列名只提醒不阻断、时间与库里数据无交集必拦、取值不在枚举必拦、年份月份与原话不符必拦、归因问题跳过时间校验、致命问题分流到拒答/澄清、失败退回普通生成、两引擎都传得到计划提示 |
@@ -740,7 +822,7 @@ python -m evals.run_eval --with-lessons
 | 拒答/澄清正确率 | 10/10（100%，该说不的时候没编数） |
 | 一次通过率 | 53/53（100%，无重试） |
 | 平均耗时 | 1.16 秒/题；P95 2.53 秒 |
-| 模型调用 | 63 次，输入 179,066 / 输出 4,394 tokens |
+| 模型调用 | 63 次，输入 179,065 / 输出 4,375 tokens |
 
 > 与 0.9.2 相比调用 46 → 63 次、token +22%：43 条有答案题里有 10 条触发了查询计划
 > （比率/派生指标、多层限定、多轮追问），每条多一次约 2.5k 输入的调用。
@@ -748,8 +830,9 @@ python -m evals.run_eval --with-lessons
 > **53 条用例里 0 条触发探查**，因为示例库的枚举列都写在 `catalog.yaml` 里，模型有取值可依。
 > 准确率始终是 53/53。在意成本就用 `--no-plan` / `--no-peek`。
 >
-> 0.12.0（词典自动生成）**对这条链路零影响** —— `catalog` 是离线命令，不改提示词、不加调用：
-> 53/53、63 次调用、token 与 0.11.0 持平（179,084 → 179,066 是同一次生成的正常波动）。
+> 0.12.0（词典自动生成）与 0.13.0（MCP server）**对这条链路零影响** —— 前者是离线命令，
+> 后者只是把 `-f json` 的输出抽成共享模块并加了 `serve`，都没改提示词、没加调用：
+> 53/53、63 次调用、token 三次持平（179,084 → 179,066 → 179,065 是同一次生成的正常波动）。
 > 它的收益体现在"接入新库"那一步，对比见上面 `catalog` 小节。
 
 用途例覆盖十一类：总量指标（5）、维度汇总（7）、排名 Top-N（5）、条件筛选（6）、业务口径（4）、
@@ -827,6 +910,9 @@ streamlit run app/main.py
   再写最终 SQL。只借机制，没照搬"任意只读查询"——白名单与额度都是本项目收窄的
 - **词典描述自动生成**（XiYan-SQL 的 `DBDescGen`）：只借"接新库自动出描述"这个目标，
   分工反着来 —— 代码实测事实、模型只补语义、人拍板（见 `catalog` 小节）
+- **对外协议**（Model Context Protocol）：把 `ask` / `get_schema` / `generate_catalog` 包成
+  stdio server，别的 Agent 可直接调用。借的是协议本身，工具边界（只读、截断、结构化错误）
+  是按"返回值会进另一个模型的上下文"这条约束重新划的
 - **命令行形态**（natural-sql / nlsql / simonw-llm）：子命令结构、`--format` 多格式输出、
   `chat -c` 续聊、`logs` 查询运行记录、stdin 管道、语义化退出码
 
