@@ -88,7 +88,12 @@ class TestContainerFiles(unittest.TestCase):
         self.assertIn("docs/", lines)
 
     def test_gitignore_excludes_secrets_and_docs(self):
-        text = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        # .dockerignore 刻意排除了 .gitignore：镜像里没有源码树，不需要它。
+        # 容器内跑同一套测试时这个文件不存在，跳过而不是报错；源码树上照常检查。
+        path = ROOT / ".gitignore"
+        if not path.exists():
+            self.skipTest("容器内无 .gitignore（已被 .dockerignore 排除）")
+        text = path.read_text(encoding="utf-8")
         self.assertIn(".env", text)
         self.assertIn("docs/", text)
         self.assertIn("output/", text)
