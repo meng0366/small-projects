@@ -24,9 +24,11 @@ from app.logging_utils import log_event, log_run, new_trace_id, trace_fields
 from app.nodes.answer import generate_insight, local_insight, summarize_result
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_code, generate_sql
+from app.nodes.plan import build_plan
 from app.nodes.reflect import is_aggregate_empty, is_empty_result
 from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
+from app.tools.enum_guard import build_clarify_answer
 from app.tools.time_anchor import format_time_hint, out_of_range_answer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
@@ -44,6 +46,8 @@ class AskResult:
     chart_type: str = "none"
     summary: str = ""
     trace_id: str = ""              # 本次问答的追踪号（P2-2），阶段事件与汇总行共用
+    plan: Optional[dict] = None     # 结构化查询计划（P1），None 表示这次没出计划
+    plan_issues: List[dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     refuse_reason: str = ""         # 理解阶段直接拒答的原因（P0 时间锚点），无生成无执行
 
@@ -130,6 +134,9 @@ class DataAgent:
             "errors": list(res.errors),
             "retry_count": 0,
             "trace_id": res.trace_id,
+            "plan": res.plan,
+            "plan_issues": list(res.plan_issues),
+            "plan_used": bool(res.plan),
             "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
             "insight": res.refuse_reason or res.insight,
             "suggestions": [],
@@ -166,13 +173,54 @@ class DataAgent:
                                 coverage=self.ctx.date_coverage)
         terms = (self.terms + "\n\n" + hint).strip() if hint else self.terms
 
-        if self.db_path and not force_pandas:
-            self._try_sql(question, res, terms=terms)
+        use_sql = bool(self.db_path) and not force_pandas
+        # 计划先行（P1）：与状态机走同一个 build_plan，不另写一套判断。
+        # 线性版没有 clarify 节点，所以三类致命问题都直接转成"说明为什么不给数"。
+        plan_started = time.perf_counter()
+        plan_update = build_plan(
+            self.ctx, question, route="sql" if use_sql else "pandas",
+            schema_info=self.db_schema if use_sql else self.df_schema,
+            terms=terms, anchors=anchors)
+        res.plan = plan_update.get("plan")
+        res.plan_issues = list(plan_update.get("plan_issues") or [])
+
+        blocked = (plan_update.get("time_defer") or plan_update.get("defer")
+                   or (build_clarify_answer(plan_update["unknown_enum"])
+                       if plan_update.get("unknown_enum") else ""))
+        if blocked:
+            res.refuse_reason = blocked
+            log_event(trace, "plan",
+                      ms=round((time.perf_counter() - plan_started) * 1000),
+                      **trace_fields({"plan_reason": plan_update.get("plan_reason"),
+                                      "plan_issues": res.plan_issues,
+                                      "time_defer": plan_update.get("time_defer")},
+                                     failed=True))
+            log_event(trace, "answer", ms=0, failed=True)
+            log_run(ok=False, trace_id=trace, engine="linear", route="refuse",
+                    retries=0, rows=0, empty=False, chart="none",
+                    plan=plan_update.get("plan_reason", ""),
+                    plan_issues=len(res.plan_issues),
+                    elapsed=round(time.perf_counter() - started, 2),
+                    question=(question or "")[:200], question_len=len(question or ""),
+                    errors=0, error="计划校验未通过")
+            return res
+        # 只在**真的出了计划**时记阶段事件：跳过的计划不是阶段，
+        # 它写在汇总行的 plan 字段里（与状态机一致 —— 那边没走到 plan 节点就没这行）
+        if res.plan:
+            log_event(trace, "plan",
+                      ms=round((time.perf_counter() - plan_started) * 1000),
+                      **trace_fields({"plan_reason": plan_update.get("plan_reason"),
+                                      "plan_issues": res.plan_issues}))
+        plan_hint = plan_update.get("plan_hint") or ""
+
+        if use_sql:
+            self._try_sql(question, res, terms=terms, plan_hint=plan_hint)
 
         # SQL 失败才回退 pandas；回退这件事本身要写进链里，否则看不出"为什么慢/为什么换了路线"
         fallback = res.df is None and bool(self.db_path) and not force_pandas
         if res.df is None:
-            self._try_pandas(question, res, fallback=fallback, terms=terms)
+            self._try_pandas(question, res, fallback=fallback, terms=terms,
+                             plan_hint=plan_hint)
 
         if res.df is not None:
             answered = time.perf_counter()
@@ -207,11 +255,13 @@ class DataAgent:
         )
         return res
 
-    def _try_sql(self, question: str, res: AskResult, terms: str = None) -> None:
+    def _try_sql(self, question: str, res: AskResult, terms: str = None,
+                 plan_hint: str = "") -> None:
         trace = res.trace_id
         started = time.perf_counter()
         try:
-            sql = generate_sql(self.db_schema, terms or self.terms, question)
+            sql = generate_sql(self.db_schema, terms or self.terms, question,
+                               plan_hint=plan_hint)
         except Exception as e:
             msg = f"SQL 生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)
@@ -239,11 +289,12 @@ class DataAgent:
                       **trace_fields({"route": "sql", "error": msg}, failed=True))
 
     def _try_pandas(self, question: str, res: AskResult, fallback: bool = False,
-                    terms: str = None) -> None:
+                    terms: str = None, plan_hint: str = "") -> None:
         trace = res.trace_id
         started = time.perf_counter()
         try:
-            code = generate_code(self.df_schema, terms or self.terms, question)
+            code = generate_code(self.df_schema, terms or self.terms, question,
+                                 plan_hint=plan_hint)
         except Exception as e:
             msg = f"代码生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)

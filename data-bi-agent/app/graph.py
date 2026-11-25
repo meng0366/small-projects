@@ -31,6 +31,7 @@ from app.logging_utils import TokenCounter, log_event, log_run, new_trace_id, tr
 from app.nodes.answer import generate_insight, local_insight
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_attribution_sql, generate_code, generate_sql
+from app.nodes.plan import make_plan_node
 from app.nodes.reflect import (
     EMPTY_RESULT_NOTE,
     DEFAULT_MAX_RETRIES,
@@ -76,21 +77,26 @@ def make_generate_node(ctx: AgentContext):
         used = [item.get("id", "") for item in lessons]
 
         intent = state.get("attribution_intent")
+        # 计划先行（P1）：计划已通过代码校验，拼在问题后面一起下发。
+        # 重试时**沿用同一份计划** —— 空结果重试不许改口径，计划正是那条口径。
+        plan_hint = state.get("plan_hint") or ""
         try:
             if intent and route == "sql":
                 # 归因问题要的不是"一个总数"，而是能拆的交叉表（P1-2）
                 statement = generate_attribution_sql(
                     state.get("schema_info", ""), state.get("terms", ""), question, intent,
                     previous_error=previous_error, previous_empty=previous_empty,
-                    lessons=lessons)
+                    lessons=lessons, plan_hint=plan_hint)
             elif route == "sql":
                 statement = generate_sql(state.get("schema_info", ""), state.get("terms", ""),
                                          question, previous_error=previous_error,
-                                         previous_empty=previous_empty, lessons=lessons)
+                                         previous_empty=previous_empty, lessons=lessons,
+                                         plan_hint=plan_hint)
             else:
                 statement = generate_code(state.get("schema_info", ""), state.get("terms", ""),
                                           question, previous_error=previous_error,
-                                          previous_empty=previous_empty, lessons=lessons)
+                                          previous_empty=previous_empty, lessons=lessons,
+                                          plan_hint=plan_hint)
         except Exception as e:
             return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}",
                     "lessons_used": used}
@@ -319,8 +325,13 @@ def make_clarify_node(ctx: AgentContext):
         # 与取值澄清共用这个终止节点，都不该进生成 —— 让模型去"放宽时间"
         # 正是 P0-2b 拿回别的年份数据冒充的起点。
         time_defer = (state.get("time_defer") or "").strip()
+        # 计划校验发现"计划里的年份/月份与用户原话不一致"时，也走这个终止节点：
+        # 不给数的理由必须说清楚，而不是让生成阶段去"改一改就查得出来"（P1）
+        plan_defer = (state.get("defer") or "").strip()
         if time_defer:
             answer = time_defer
+        elif plan_defer:
+            answer = plan_defer
         else:
             answer = build_clarify_answer(state.get("unknown_enum") or {})
         return {"answer": answer, "insight": answer,
@@ -330,8 +341,19 @@ def make_clarify_node(ctx: AgentContext):
 
 
 def route_after_understand(state: AgentState) -> str:
-    """条件边：取值对不上、或相对时间超出覆盖范围，都先澄清不生成。"""
+    """条件边：取值/时间对不上先澄清；需要先想清楚就先出计划，否则直接生成。"""
     if state.get("time_defer") or state.get("unknown_enum"):
+        return "clarify"
+    return "plan" if state.get("plan_needed") else "generate"
+
+
+def route_after_plan(state: AgentState) -> str:
+    """条件边：计划校验出致命问题就短路澄清，否则带着计划去生成（P1）。
+
+    致命问题只有三类（时间无交集、取值不存在、年份被换），都由代码判定；
+    表名列名对不上只算提醒，照常生成 —— 误拦比漏拦更伤。
+    """
+    if state.get("time_defer") or state.get("unknown_enum") or state.get("defer"):
         return "clarify"
     return "generate"
 
@@ -372,6 +394,7 @@ def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
 
     builder = StateGraph(AgentState)
     builder.add_node("understand", _traced("understand", make_understand_node(ctx)))
+    builder.add_node("plan", _traced("plan", make_plan_node(ctx)))
     builder.add_node("clarify", _traced("clarify", make_clarify_node(ctx)))
     builder.add_node("generate", _traced("generate", make_generate_node(ctx)))
     builder.add_node("execute", _traced("execute", make_execute_node(ctx)))
@@ -382,6 +405,9 @@ def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
     builder.add_edge(START, "understand")
     builder.add_conditional_edges(
         "understand", route_after_understand,
+        {"plan": "plan", "generate": "generate", "clarify": "clarify"})
+    builder.add_conditional_edges(
+        "plan", route_after_plan,
         {"generate": "generate", "clarify": "clarify"})
     builder.add_edge("clarify", END)
     builder.add_edge("generate", "execute")
@@ -484,6 +510,8 @@ class GraphAgent:
             clarify=bool(unknown),
             defer=bool(state.get("defer")),
             attribution=bool((state.get("attribution") or {}).get("ok")),
+            plan=state.get("plan_reason", ""),
+            plan_issues=len(state.get("plan_issues") or []),
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),

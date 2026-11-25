@@ -19,6 +19,7 @@ from app.prompts.templates import REWRITE_SYSTEM, REWRITE_USER_TEMPLATE
 from app.state import AgentState
 from app.tools.attribution import detect_attribution
 from app.tools.enum_guard import find_unknown_enum
+from app.tools.plan_guard import needs_plan
 from app.tools.time_anchor import format_time_hint, out_of_range_answer
 
 HISTORY_LIMIT = 6  # 最多带入 6 条历史（约 3 轮）
@@ -89,6 +90,13 @@ def make_understand_node(ctx: AgentContext):
             terms = (terms + "\n\n" + hint).strip() if terms else hint
         time_defer = out_of_range_answer(anchors, ctx.date_coverage)
 
+        # 是否需要先出计划（P1）：零 token 判断，决定 understand 之后走哪条边。
+        # 判定放在这里而不是 plan 节点里，是为了让"走不走计划"在状态机上可见，
+        # 否则条件边要重复调一次模型才知道该不该走。
+        plan_needed, plan_reason = needs_plan(
+            rewritten, has_history=bool(history), anchors=anchors,
+            intent=intent, route=route)
+
         return {
             "rewritten_question": rewritten,
             "route": route,
@@ -98,6 +106,8 @@ def make_understand_node(ctx: AgentContext):
             "unknown_enum": unknown,
             "attribution_intent": intent,
             "time_defer": time_defer,
+            "plan_needed": plan_needed,
+            "plan_reason": plan_reason,
         }
 
     return node

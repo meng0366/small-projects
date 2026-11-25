@@ -243,7 +243,7 @@ class TestEndToEnd(_TempHome):
         captured = {}
 
         def fake_generate_sql(schema, terms, question, previous_error=None,
-                              previous_empty=False, lessons=None):
+                              previous_empty=False, lessons=None, plan_hint=""):
             captured["lessons"] = lessons
             return SQL_GOOD
 
@@ -264,7 +264,7 @@ class TestEndToEnd(_TempHome):
         captured = {}
 
         def fake_generate_sql(schema, terms, question, previous_error=None,
-                              previous_empty=False, lessons=None):
+                              previous_empty=False, lessons=None, plan_hint=""):
             captured["lessons"] = lessons
             return SQL_GOOD
 

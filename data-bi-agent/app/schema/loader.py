@@ -131,6 +131,22 @@ def _table_columns(db_path: str, table: str) -> list:
         con.close()
 
 
+def describe_tables(db_path: str) -> dict:
+    """`{表名: [列名]}`：给"计划校验"用，判断计划里提到的表和列是否真实存在。
+
+    为什么不解析 schema 文本：`build_db_schema_text` 是给人/模型读的 markdown，
+    格式会随文案调整，拿它反解表列会在某次改文案后悄悄失效。
+    直接读库结构，改文案不会影响校验。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        return {table: [name for name, _ in _table_columns(db_path, table)]
+                for table in list_tables(db_path)}
+    except sqlite3.Error:
+        return {}
+
+
 def _table_row_count(db_path: str, table: str) -> int:
     con = sqlite3.connect(db_path)
     try:

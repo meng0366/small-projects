@@ -18,6 +18,7 @@ from app.schema.loader import (
     build_db_schema_text,
     build_schema_text,
     collect_data_profile,
+    describe_tables,
     format_data_profile,
     get_db_path,
     load_catalog,
@@ -36,6 +37,7 @@ class AgentContext:
     csv_name: str = "sales_orders.csv"
     db_file: Optional[str] = None    # 命令行 `--db` 指定的库文件，优先于 data/ 下的默认库
     use_lessons: bool = True         # 是否加载修正回流（few-shot）；评测基线用 False 保证可比
+    use_plan: bool = True            # 是否先出查询计划（P1）；计划会多一次模型调用，可关掉省钱
 
     @cached_property
     def db_path(self) -> Optional[str]:
@@ -64,6 +66,20 @@ class AgentContext:
         空结果复核、取值澄清都基于事实，而不是猜。
         """
         return collect_data_profile(self.db_path, self.catalog) if self.db_path else {}
+
+    @cached_property
+    def db_columns(self) -> dict:
+        """`{表名: [列名]}`，供计划校验判断"计划里提到的表/列是否真的存在"。
+
+        直接读库结构而不是解析 schema 文本：schema 文本是给人读的，
+        改一次文案就会让反解失效，而校验悄无声息地不再生效是最难发现的那类退化。
+        """
+        return describe_tables(self.db_path) if self.db_path else {}
+
+    @cached_property
+    def df_columns(self) -> dict:
+        """单表路线的列（表名固定叫 dataframe），与 db_columns 同形状，便于共用校验。"""
+        return {"dataframe": [str(c) for c in self.df.columns]}
 
     @cached_property
     def data_profile_text(self) -> str:

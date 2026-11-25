@@ -57,6 +57,7 @@ from app.tools.lesson_store import (
     score_lesson,
     select_lessons,
 )
+from app.tools.plan_guard import format_plan_summary
 
 # Windows 控制台默认可能是 GBK，强制 UTF-8 输出，避免中文打印报 UnicodeEncodeError
 if hasattr(sys.stdout, "reconfigure"):
@@ -64,9 +65,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.9.2"
-"""与项目阶段对齐：阶段 6 是计划外增强（CLI 子命令、会话续聊、追问建议）；
-0.7 是改进清单 P1-1（修正回流 teach/lessons）；0.8 是 P1-2（指标归因）。"""
+VERSION = "0.10.0"
+"""与项目阶段对齐：0.9 = 第九轮调研的守卫与归因增强；0.10 = 计划先行（P1）。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
                "teach", "t", "lessons", "ls", "version", "help")
@@ -101,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--db", metavar="PATH", help="使用指定的 SQLite 库文件（默认 data/sales.db）")
         p.add_argument("--no-chart", action="store_true", help="不生成图表")
         p.add_argument("--no-insight", action="store_true", help="不生成洞察文案（省一次模型调用）")
+        p.add_argument("--no-plan", action="store_true",
+                       help="不先出查询计划（省一次模型调用；计划用于提前发现理解错误）")
         p.add_argument("--linear", action="store_true", help="用线性编排（无重试、无多轮记忆）")
         p.add_argument("--pandas", action="store_true", help="线性模式下强制走单表 pandas")
 
@@ -171,7 +173,8 @@ def normalize_argv(argv: list) -> list:
 def make_context(args) -> AgentContext:
     """按 `--db` 构造数据上下文。"""
     db_file = getattr(args, "db", None)
-    return AgentContext(db_file=db_file) if db_file else AgentContext()
+    use_plan = not getattr(args, "no_plan", False)
+    return AgentContext(db_file=db_file, use_plan=use_plan)
 
 
 def build_agent(args):
@@ -243,6 +246,17 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
             print(f"  · {err}")
         _print_trace_hint(state)
         return
+
+    # 计划先行（P1）：先把"模型理解成了什么"摆出来，再看它写了什么 SQL。
+    # 只在真的出了计划时显示 —— 简单问题不走这步，多一行空标题没意义。
+    plan = state.get("plan") or {}
+    if plan:
+        print(f"\n[计划] {format_plan_summary(plan)}")
+        for issue in state.get("plan_issues") or []:
+            if issue.get("kind") == "assumption":
+                print(f"  · 假设：{issue.get('message')}")
+            elif issue.get("level") == "warn" and issue.get("kind") in ("table", "column"):
+                print(f"  · 注意：{issue.get('message')}")
 
     statement = state.get("statement") or ""
     if statement and not quiet:
@@ -318,6 +332,12 @@ def _build_payload(state: dict, question: str) -> dict:
         "question": question,
         "rewritten": state.get("rewritten_question") or "",
         "trace_id": state.get("trace_id") or "",
+        "plan": {
+            "used": bool(state.get("plan")),
+            "reason": state.get("plan_reason") or "",
+            "content": state.get("plan"),
+            "issues": state.get("plan_issues") or [],
+        },
         "ok": df is not None,
         "route": state.get("route") or "",
         "statement": state.get("statement") or "",

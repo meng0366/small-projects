@@ -29,6 +29,14 @@ class AgentState(TypedDict, total=False):
     unknown_enum: Any                # 用户提到的枚举值库里没有时，记录澄清信息（P0-1b）
     time_defer: str                  # 相对时间完全超出数据覆盖范围时的说明（P0）；非空则直接拒答
     attribution_intent: Any          # 归因意图：谁跟谁比（P1-2），None 表示普通问答
+    plan_needed: bool                # 是否需要先出计划（P1）；决定 understand 之后走哪条边
+
+    # ---- 计划（P1 计划先行）----
+    plan: Any                        # 结构化查询计划（指标/表/维度/过滤/时间/假设）
+    plan_hint: str                   # 计划拼成的生成引导语，注入生成阶段
+    plan_issues: List[dict]          # 校验结果：fatal 会短路到澄清，warn 只作提示
+    plan_used: bool                  # 本次是否真的用上了计划（解析失败时为 False）
+    plan_reason: str                 # 用/不用的原因，便于排查"为什么这次没出计划"
 
     # ---- 生成与执行 ----
     statement: str                   # 生成的 SQL 或 Python 代码

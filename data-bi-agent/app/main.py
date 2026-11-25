@@ -93,6 +93,12 @@ def render_sidebar(ctx: AgentContext) -> tuple:
         with_insight = st.toggle("生成洞察结论", value=True,
                                  help="关闭可省一次模型调用")
         show_code = st.toggle("显示生成的 SQL / 代码", value=True)
+        # 计划会多一次模型调用，给个开关：默认开（能提前发现理解错误），
+        # 对成本敏感或问题很简单时可以关掉。
+        ctx.use_plan = st.toggle(
+            "先出查询计划（多一次模型调用）", value=ctx.use_plan,
+            help="生成 SQL 前先让模型写出指标/表/维度/过滤/时间，由代码校验表列是否存在、"
+                 "时间是否有数据、取值是否真实。能拦住「理解错但数字看着对」的情况。")
 
         st.divider()
         st.subheader("示例问题")
@@ -136,6 +142,8 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "insight": state.get("insight") or "",
         "answer": state.get("answer") or "",
         "attribution": state.get("attribution") or {},
+        "plan": state.get("plan") or {},
+        "plan_issues": state.get("plan_issues") or [],
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -190,6 +198,16 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
             if fig is not None:
                 st.plotly_chart(fig, width="stretch")
                 st.caption(f"图表类型：{CHART_TYPE_LABEL.get(chart_type, chart_type)}")
+
+        # 计划先行（P1）：默认收起。它回答的是"系统把你的话理解成了什么"，
+        # 结果对的时候没人看它，一旦数字反常，这里就是第一现场。
+        if msg.get("plan"):
+            issues = msg.get("plan_issues") or []
+            assumptions = [i["message"] for i in issues if i.get("kind") == "assumption"]
+            with st.expander("查询计划（系统按这个理解你的问题）", expanded=False):
+                st.json(msg["plan"])
+                for text in assumptions:
+                    st.caption(f"假设：{text}")
 
         if att.get("ok"):
             st.caption(f"归因明细：「{att.get('current_label')}」对比"
