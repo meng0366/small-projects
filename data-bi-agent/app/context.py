@@ -6,7 +6,7 @@
 
 所有重资源都用 cached_property，进程内只加载一次。
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 import os
 from typing import Optional
@@ -30,6 +30,16 @@ from app.tools.lesson_store import load_lessons
 from app.tools.time_anchor import resolve_time_anchor
 
 
+def _cache_default() -> bool:
+    """默认是否复用历史 SQL（P1）。
+
+    `AGENT_CACHE=0` 关掉。离线测试统一走这条（见 `tests/__init__.py`）：
+    用例之间共享同一份缓存目录，前一个用例写入的条目会被后一个命中，
+    "应该调用生成"的断言就会莫名其妙失败 —— 那是测试互相污染，不是功能问题。
+    """
+    return os.getenv("AGENT_CACHE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 @dataclass
 class AgentContext:
     """一次会话的静态数据上下文（数据源 + 语义）。"""
@@ -39,6 +49,8 @@ class AgentContext:
     use_lessons: bool = True         # 是否加载修正回流（few-shot）；评测基线用 False 保证可比
     use_plan: bool = True            # 是否先出查询计划（P1）；计划会多一次模型调用，可关掉省钱
     use_peek: bool = True            # 是否允许两段式探查（P1）；只在模型不确定取值时才多一次调用
+    # 是否复用同一问题的历史 SQL（P1）；`AGENT_CACHE=0` 或 `--no-cache` 可关
+    use_cache: bool = field(default_factory=_cache_default)
 
     @cached_property
     def db_path(self) -> Optional[str]:

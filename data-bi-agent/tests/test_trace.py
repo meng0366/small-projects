@@ -19,6 +19,13 @@ import tempfile
 import unittest
 from unittest import mock
 
+try:
+    import _env  # noqa: F401  测试环境隔离（临时 AGENT_HOME、关闭 SQL 复用）
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+
 import app.agent as A
 import app.graph as G
 import app.logging_utils as lu
@@ -155,7 +162,10 @@ class TestGraphTrace(TraceLogCase):
     def test_happy_path_has_full_chain(self):
         state = self._run()
         trace = state["trace_id"]
-        self.assertEqual(self.stages_of(trace), ["understand", "generate", "execute", "answer"])
+        # cache 是 0.15.0 新增的第一段：先看能不能复用历史 SQL，没有再理解问题。
+        # 即使没命中它也留一行 —— "为什么这次没复用"就在这一行里。
+        self.assertEqual(self.stages_of(trace),
+                         ["cache", "understand", "generate", "execute", "answer"])
 
         # 汇总行必须是同一个追踪号，否则"结果"和"过程"对不上号
         summaries = lu.read_runs(limit=0, path=self.log_file)
@@ -168,6 +178,8 @@ class TestGraphTrace(TraceLogCase):
         self.assertEqual(events["understand"]["route"], "sql")
         self.assertGreater(events["generate"]["statement_len"], 0)
         self.assertEqual(events["execute"]["rows"], 5)
+        # 缓存没命中时要留下原因（测试环境默认关闭复用，见 tests/_env.py）
+        self.assertTrue(events["cache"].get("cache_note"))
         # 语句原文绝不进日志
         self.assertNotIn("SELECT", json.dumps(events, ensure_ascii=False))
 
@@ -182,14 +194,14 @@ class TestGraphTrace(TraceLogCase):
         """取值对不上时只走 understand → clarify，不该出现"生成过"的痕迹。"""
         state = self._run(question="办公用品类产品的销售额是多少？")
         stages = self.stages_of(state["trace_id"])
-        self.assertEqual(stages, ["understand", "clarify"])
+        self.assertEqual(stages, ["cache", "understand", "clarify"])
 
     def test_two_runs_get_different_traces(self):
         first = self._run()["trace_id"]
         second = self._run()["trace_id"]
         self.assertNotEqual(first, second)
-        self.assertEqual(len(lu.read_events(first, path=self.log_file)), 4)
-        self.assertEqual(len(lu.read_events(second, path=self.log_file)), 4)
+        self.assertEqual(len(lu.read_events(first, path=self.log_file)), 5)
+        self.assertEqual(len(lu.read_events(second, path=self.log_file)), 5)
 
     def test_node_exception_is_recorded_and_raised(self):
         """节点抛异常时链里留一条 failed 事件，否则这条链会缺一段、看不出断在哪。"""

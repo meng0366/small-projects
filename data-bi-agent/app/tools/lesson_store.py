@@ -55,6 +55,22 @@ class LessonError(Exception):
     """lesson 入库校验失败（内容为空、SQL 不安全、跑不通等）。"""
 
 
+def _drop_sql_cache(ctx=None, path: Optional[str] = None) -> None:
+    """用户修正了这类问题 → 该类问题的历史 SQL 立刻作废。
+
+    不做这一步会有个很隐蔽的坑：teach 之后问题原文没变，SQL 复用直接命中
+    修正**之前**的那条语句，于是"教过了却还是错的答案"，而日志里一切正常。
+    只在走默认存储位置时清（测试传 path 时不该动全局缓存）。
+    """
+    if path:
+        return
+    try:
+        from app.tools import sql_cache
+        sql_cache.invalidate_cache(ctx)
+    except Exception:
+        pass          # 清缓存失败不该让 teach 失败
+
+
 # ---------------------------------------------------------------- 存取位置
 def _context():
     """默认上下文（惰性导入，避开与 context.py 的循环依赖）。"""
@@ -195,6 +211,7 @@ def add_lesson(question: str, output: str, note: str = "", kind: Optional[str] =
                              "note": note or existing.get("note", ""),
                              "updated": datetime.now().isoformat(timespec="seconds")})
             _write(file, items)
+            _drop_sql_cache(ctx, path)
             return existing
 
     lesson = {
@@ -208,6 +225,7 @@ def add_lesson(question: str, output: str, note: str = "", kind: Optional[str] =
     }
     items.append(lesson)
     _write(file, items)
+    _drop_sql_cache(ctx, path)
     return lesson
 
 
@@ -220,6 +238,7 @@ def remove_lesson(lesson_id: str, ctx: Optional[AgentContext] = None,
     if len(kept) == len(items):
         return False
     _write(file, kept)
+    _drop_sql_cache(ctx, path)
     return True
 
 

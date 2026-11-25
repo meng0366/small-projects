@@ -153,6 +153,8 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "peek_used": bool(state.get("peek_used")),
         "peek_note": state.get("peek_note") or "",
         "peek_error": state.get("peek_error") or "",
+        "cache_hit": bool(state.get("cache_hit")),
+        "cache_note": state.get("cache_note") or "",
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -191,6 +193,8 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
         st.markdown(msg["insight"])
 
     meta = [ROUTE_LABEL.get(msg.get("route", ""), ""), f"{len(df)} 行 × {df.shape[1]} 列"]
+    if msg.get("cache_hit"):
+        meta.append("复用上次的查询")
     if msg.get("retry"):
         meta.append(f"自动重试 {msg['retry']} 次后完成")
     st.caption("　|　".join(m for m in meta if m))

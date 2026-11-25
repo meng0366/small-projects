@@ -80,7 +80,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 """与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成；
 0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）；
 0.13.1 = 半年（上半年 / H1）纳入范围守卫，并修掉「今年上半年」被当成全年的锚点误判；
@@ -126,6 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="不先出查询计划（省一次模型调用；计划用于提前发现理解错误）")
         p.add_argument("--no-peek", action="store_true",
                        help="不允许两段式探查（模型不确定取值时先看一眼真实数据）")
+        p.add_argument("--no-cache", action="store_true",
+                       help="不复用历史 SQL（每次都让模型重写；调整口径、排查异常时用）")
         p.add_argument("--linear", action="store_true", help="用线性编排（无重试、无多轮记忆）")
         p.add_argument("--pandas", action="store_true", help="线性模式下强制走单表 pandas")
 
@@ -218,7 +220,9 @@ def make_context(args) -> AgentContext:
     db_file = getattr(args, "db", None)
     use_plan = not getattr(args, "no_plan", False)
     use_peek = not getattr(args, "no_peek", False)
-    return AgentContext(db_file=db_file, use_plan=use_plan, use_peek=use_peek)
+    use_cache = not getattr(args, "no_cache", False)
+    return AgentContext(db_file=db_file, use_plan=use_plan, use_peek=use_peek,
+                        use_cache=use_cache)
 
 
 def build_agent(args):
@@ -276,6 +280,12 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
     route = state.get("route") or ""
     if route:
         print(f"[路由] {ROUTE_LABEL.get(route, route)}")
+
+    # SQL 复用（P1）：命中时明确说出来 —— 用户有权知道"这个数没让模型重算"，
+    # 尤其是他觉得结果可疑的时候（该用 --no-cache 重跑一次对比）。
+    if state.get("cache_hit"):
+        note = state.get("cache_note") or "复用了上次跑通的查询"
+        print(f"[复用] {note}")
 
     retries = int(state.get("retry_count") or 0)
     if retries:

@@ -30,6 +30,12 @@ from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
 from app.tools.enum_guard import build_clarify_answer
 from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
+from app.tools.sql_cache import (
+    find_cached_sql,
+    forget_sql,
+    remember_sql,
+    result_fingerprint,
+)
 from app.tools.time_anchor import format_time_hint, out_of_range_answer
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
@@ -52,6 +58,10 @@ class AskResult:
     peek: dict = field(default_factory=dict)   # 两段式探查（P1）：used/rows/note/error/ms
     errors: List[str] = field(default_factory=list)
     refuse_reason: str = ""         # 理解阶段直接拒答的原因（P0 时间锚点），无生成无执行
+    # SQL 复用（P1）：命中时 statement 来自缓存，这次没有"生成"这一步
+    cache_hit: bool = False
+    cache_note: str = ""
+    cached_insight: str = ""        # 上次的洞察文案（结果指纹一致时才填）
 
     @property
     def ok(self) -> bool:
@@ -144,6 +154,8 @@ class DataAgent:
             "peek_rows": int(res.peek.get("peek_rows") or 0),
             "peek_error": res.peek.get("peek_error", ""),
             "peek_ms": int(res.peek.get("peek_ms") or 0),
+            "cache_hit": bool(res.cache_hit),
+            "cache_note": res.cache_note,
             "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
             "insight": res.refuse_reason or res.insight,
             "suggestions": [],
@@ -181,46 +193,59 @@ class DataAgent:
         terms = (self.terms + "\n\n" + hint).strip() if hint else self.terms
 
         use_sql = bool(self.db_path) and not force_pandas
-        # 计划先行（P1）：与状态机走同一个 build_plan，不另写一套判断。
-        # 线性版没有 clarify 节点，所以三类致命问题都直接转成"说明为什么不给数"。
-        plan_started = time.perf_counter()
-        plan_update = build_plan(
-            self.ctx, question, route="sql" if use_sql else "pandas",
-            schema_info=self.db_schema if use_sql else self.df_schema,
-            terms=terms, anchors=anchors)
-        res.plan = plan_update.get("plan")
-        res.plan_issues = list(plan_update.get("plan_issues") or [])
 
-        blocked = (plan_update.get("time_defer") or plan_update.get("defer")
-                   or (build_clarify_answer(plan_update["unknown_enum"])
-                       if plan_update.get("unknown_enum") else ""))
-        if blocked:
-            res.refuse_reason = blocked
-            log_event(trace, "plan",
-                      ms=round((time.perf_counter() - plan_started) * 1000),
-                      **trace_fields({"plan_reason": plan_update.get("plan_reason"),
-                                      "plan_issues": res.plan_issues,
-                                      "time_defer": plan_update.get("time_defer")},
-                                     failed=True))
-            log_event(trace, "answer", ms=0, failed=True)
-            log_run(ok=False, trace_id=trace, engine="linear", route="refuse",
-                    retries=0, rows=0, empty=False, chart="none",
-                    plan=plan_update.get("plan_reason", ""),
-                    plan_issues=len(res.plan_issues),
-                    elapsed=round(time.perf_counter() - started, 2),
-                    question=(question or "")[:200], question_len=len(question or ""),
-                    errors=0, error="计划校验未通过")
-            return res
-        # 只在**真的出了计划**时记阶段事件：跳过的计划不是阶段，
-        # 它写在汇总行的 plan 字段里（与状态机一致 —— 那边没走到 plan 节点就没这行）
-        if res.plan:
-            log_event(trace, "plan",
-                      ms=round((time.perf_counter() - plan_started) * 1000),
-                      **trace_fields({"plan_reason": plan_update.get("plan_reason"),
-                                      "plan_issues": res.plan_issues}))
-        plan_hint = plan_update.get("plan_hint") or ""
+        # SQL 复用（P1）：命中就直接执行历史 SQL，跳过计划与生成。
+        # 刻意放在计划之前 —— 计划要花一次调用，命中时先花这个钱就等于白省。
+        # 跑不通（表/字段变了）会把条目作废并返回 False，照常走下面的流程。
+        reused = False
+        if use_sql and self.ctx.use_cache:
+            entry, note = find_cached_sql(question, self.ctx)
+            if entry:
+                reused = self._run_cached(question, res, entry, note)
 
-        if use_sql:
+        plan_update = {}
+        plan_hint = ""
+        if not reused:
+            # 计划先行（P1）：与状态机走同一个 build_plan，不另写一套判断。
+            # 线性版没有 clarify 节点，所以三类致命问题都直接转成"说明为什么不给数"。
+            plan_started = time.perf_counter()
+            plan_update = build_plan(
+                self.ctx, question, route="sql" if use_sql else "pandas",
+                schema_info=self.db_schema if use_sql else self.df_schema,
+                terms=terms, anchors=anchors)
+            res.plan = plan_update.get("plan")
+            res.plan_issues = list(plan_update.get("plan_issues") or [])
+
+            blocked = (plan_update.get("time_defer") or plan_update.get("defer")
+                       or (build_clarify_answer(plan_update["unknown_enum"])
+                           if plan_update.get("unknown_enum") else ""))
+            if blocked:
+                res.refuse_reason = blocked
+                log_event(trace, "plan",
+                          ms=round((time.perf_counter() - plan_started) * 1000),
+                          **trace_fields({"plan_reason": plan_update.get("plan_reason"),
+                                          "plan_issues": res.plan_issues,
+                                          "time_defer": plan_update.get("time_defer")},
+                                         failed=True))
+                log_event(trace, "answer", ms=0, failed=True)
+                log_run(ok=False, trace_id=trace, engine="linear", route="refuse",
+                        retries=0, rows=0, empty=False, chart="none",
+                        plan=plan_update.get("plan_reason", ""),
+                        plan_issues=len(res.plan_issues),
+                        elapsed=round(time.perf_counter() - started, 2),
+                        question=(question or "")[:200], question_len=len(question or ""),
+                        errors=0, error="计划校验未通过")
+                return res
+            # 只在**真的出了计划**时记阶段事件：跳过的计划不是阶段，
+            # 它写在汇总行的 plan 字段里（与状态机一致 —— 那边没走到 plan 节点就没这行）
+            if res.plan:
+                log_event(trace, "plan",
+                          ms=round((time.perf_counter() - plan_started) * 1000),
+                          **trace_fields({"plan_reason": plan_update.get("plan_reason"),
+                                          "plan_issues": res.plan_issues}))
+            plan_hint = plan_update.get("plan_hint") or ""
+
+        if use_sql and res.df is None:
             self._try_sql(question, res, terms=terms, plan_hint=plan_hint)
 
         # SQL 失败才回退 pandas；回退这件事本身要写进链里，否则看不出"为什么慢/为什么换了路线"
@@ -235,7 +260,10 @@ class DataAgent:
             if with_chart:
                 self._attach_chart(question, res)
             if with_insight:
-                res.insight = generate_insight(question, res.df)
+                # 结果指纹与上次一致时直接沿用结论 —— 这是整次问答里
+                # 复用时唯一还会剩下的一次模型调用，省掉它才是真的零成本。
+                res.insight = res.cached_insight or generate_insight(question, res.df)
+            self._remember(question, res)
             log_event(trace, "answer",
                       ms=round((time.perf_counter() - answered) * 1000),
                       **trace_fields({"result": res.df, "chart_type": res.chart_type}))
@@ -259,6 +287,8 @@ class DataAgent:
             peek_used=bool(res.peek.get("peek_used")),
             peek_rows=int(res.peek.get("peek_rows") or 0),
             peek_error=(res.peek.get("peek_error") or "")[:80],
+            cache=bool(res.cache_hit),
+            cache_note=(res.cache_note or "")[:40],
             elapsed=round(time.perf_counter() - started, 2),
             question=(question or "")[:200],
             question_len=len(question or ""),
@@ -266,6 +296,53 @@ class DataAgent:
             error=(res.errors[-1][:300] if res.errors else ""),
         )
         return res
+
+    def _run_cached(self, question: str, res: AskResult, entry: dict, note: str) -> bool:
+        """执行复用的历史 SQL；跑不通就作废这条缓存并返回 False（调用方重新生成）。
+
+        为什么失败要作废：缓存里的 SQL 对不上当前库（表被删、字段改名），
+        留着它只会每次命中、每次失败、每次再重新生成，白搭一次执行。
+        """
+        trace = res.trace_id
+        sql = str(entry.get("sql") or "")
+        started = time.perf_counter()
+        r = run_sql(sql, self.db_path)
+        if not r["ok"]:
+            forget_sql(question, self.ctx)
+            msg = f"复用的 SQL 已失效（{r['stage']} 阶段）：{r['error']}"
+            res.errors.append(msg)
+            log_event(trace, "execute",
+                      ms=round((time.perf_counter() - started) * 1000),
+                      **trace_fields({"route": "sql", "error": msg},
+                                     cache_failed=True))
+            return False
+
+        res.route, res.statement, res.df = "sql", r["sql"], r["df"]
+        res.cache_hit = True
+        res.cache_note = note
+
+        # 数据还是不是上次那份：只有指纹一致才敢沿用上次的结论
+        cached_hash = entry.get("result_fp") or ""
+        if cached_hash and result_fingerprint(res.df) == cached_hash:
+            res.cached_insight = str(entry.get("insight") or "")
+        else:
+            res.cache_note = "查询已复用，但数据有变化，结论重新生成"
+
+        log_event(trace, "execute",
+                  ms=round((time.perf_counter() - started) * 1000),
+                  **trace_fields({"route": "sql", "result": res.df,
+                                  "cache_note": res.cache_note}, cache_hit=True))
+        return True
+
+    def _remember(self, question: str, res: AskResult) -> None:
+        """把跑通的「问题 → SQL」存进缓存（只存真的给出答案的这次）。"""
+        if not self.ctx.use_cache or res.route != "sql" or not res.statement:
+            return
+        try:
+            remember_sql(question, res.statement, self.ctx,
+                         df=res.df, insight=res.insight)
+        except Exception:
+            pass          # 缓存是加速手段，写不进去不能影响这次回答
 
     def _try_sql(self, question: str, res: AskResult, terms: str = None,
                  plan_hint: str = "") -> None:

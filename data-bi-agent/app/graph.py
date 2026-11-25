@@ -29,6 +29,7 @@ from app.config import MAX_QUESTION_CHARS
 from app.context import AgentContext
 from app.logging_utils import TokenCounter, log_event, log_run, new_trace_id, trace_fields
 from app.nodes.answer import generate_insight, local_insight
+from app.nodes.cache import make_cache_node
 from app.nodes.execute import execute_code
 from app.nodes.generate import generate_attribution_sql, generate_code, generate_sql
 from app.nodes.plan import make_plan_node
@@ -48,6 +49,7 @@ from app.tools.enum_guard import build_clarify_answer
 from app.tools.lesson_store import select_lessons
 from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
+from app.tools.sql_cache import forget_sql, remember_sql, result_fingerprint
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -127,6 +129,27 @@ def make_generate_node(ctx: AgentContext):
     return node
 
 
+def _reuse_update(state: AgentState, frame) -> dict:
+    """复用时判断"这次跑出来的还是不是上次那份数据"，不是就丢掉旧结论。
+
+    SQL 复用是安全的：同一个问题、同一个库结构、同一个参考日，查询本身不变。
+    但**洞察文案依赖数据**，而库是会变的（新增订单、补录数据）。所以缓存里
+    同时存了结果指纹 —— 只有数据一字不差才敢沿用上次的结论，否则保留 SQL、
+    重新让模型看一眼新数据。
+
+    指纹算不出来（结果里有不可哈希的嵌套值）时按"不一样"处理：多花一次调用，
+    好过把一份过期的结论当新的给出去。
+    """
+    if not state.get("cache_hit"):
+        return {}
+    cached = state.get("cached_hash") or ""
+    current = result_fingerprint(frame)
+    if cached and current and cached == current:
+        return {}
+    return {"cached_insight": "", "cached_hash": current,
+            "cache_note": "查询已复用，但数据有变化，结论重新生成"}
+
+
 def make_execute_node(ctx: AgentContext):
     """执行节点：SQL 走只读库，pandas 走受限命名空间。
 
@@ -171,8 +194,20 @@ def make_execute_node(ctx: AgentContext):
                     # 拿到了数据，但是靠改动用户的条件换来的（如 2024→2025）→ 丢掉，不许用
                     return {"result": None, "defer": "；".join(problems),
                             "scope_violation": problems, **history}
-                return {"result": frame, "error": None,
-                        "empty_result": is_empty_result(frame), **history}
+                update = {"result": frame, "error": None,
+                          "empty_result": is_empty_result(frame), **history}
+                update.update(_reuse_update(state, frame))
+                return update
+            if state.get("cache_hit"):
+                # 复用的 SQL 跑不通（表被删、字段改名）→ 立刻作废这条缓存。
+                # 同时标记 cache_failed：这次失败是"缓存过时"，不是"模型理解错"，
+                # reflect 不该因此换到 pandas 路线（那会绕过全部 SQL 能力）。
+                forget_sql(state.get("question", ""), ctx)
+                return {"result": None, "cache_hit": False, "cache_failed": True,
+                        "cached_insight": "", "cached_hash": "",
+                        "cache_note": "历史 SQL 已失效，重新生成",
+                        "error": f"SQL {r['stage']} 阶段：{r['error']}",
+                        "empty_result": False, **history}
             return {"result": None, "error": f"SQL {r['stage']} 阶段：{r['error']}",
                     "empty_result": False, **history}
 
@@ -271,6 +306,29 @@ def _chart_for(frame, question: str) -> dict:
                 "error": f"图表生成失败：{type(e).__name__}: {e}"}
 
 
+def _remember(ctx: AgentContext, state: AgentState, result, insight: str) -> None:
+    """把"跑通并给出答案"的这次查询存进缓存（P1 SQL 复用）。
+
+    只在这里写，不在 execute 里写：execute 成功只说明"这条 SQL 能跑"，
+    不代表这轮问答真的给了答案（可能之后被判空结果、被判拒答）。
+    空结果与拒答固化下来最危险 —— 数据一更新，用户永远只能看到"没数据"。
+
+    多轮追问（history 非空）一律不写：缓存键是问题原文，而同一句话在不同
+    上下文里指向的可能是不同的东西，写进去会被下一次单轮提问误命中。
+    """
+    if not getattr(ctx, "use_cache", True):
+        return
+    if state.get("route") != "sql" or state.get("attribution_intent"):
+        return
+    if state.get("history"):
+        return
+    try:
+        remember_sql(state.get("question", ""), state.get("statement", ""), ctx,
+                     df=result, insight=insight)
+    except Exception:
+        pass          # 缓存是加速手段，写不进去不能影响这次回答
+
+
 def make_answer_node(ctx: AgentContext, with_chart: bool = True,
                      with_insight: bool = True):
     """回答节点：出图 + 生成洞察；彻底失败时给出可读的说明。"""
@@ -326,7 +384,19 @@ def make_answer_node(ctx: AgentContext, with_chart: bool = True,
         if with_chart:
             update.update(_chart_for(result, question))
 
-        insight = generate_insight(question, result) if with_insight else local_insight(result)
+        # 洞察文案复用（P1）：结果指纹一致才用（`_reuse_update` 已经判过），
+        # 这一条省掉的是整次问答里最后也是唯一剩下的模型调用。
+        cached = (state.get("cached_insight") or "").strip()
+        if with_insight and cached:
+            insight = cached
+            update["cache_note"] = "查询与结果都与上次一致，结论一并复用"
+        elif with_insight:
+            insight = generate_insight(question, result)
+        else:
+            insight = local_insight(result)
+
+        _remember(ctx, state, result, insight)
+
         update["insight"] = insight + note
         update["answer"] = insight + note
         return update
@@ -359,6 +429,11 @@ def make_clarify_node(ctx: AgentContext):
                 "chart_type": "none", "chart_path": "", "result": None}
 
     return node
+
+
+def route_after_cache(state: AgentState) -> str:
+    """条件边：命中缓存就直接执行，否则照常理解问题（P1 SQL 复用）。"""
+    return "execute" if state.get("cache_hit") and state.get("statement") else "understand"
 
 
 def route_after_understand(state: AgentState) -> str:
@@ -414,6 +489,7 @@ def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
     ctx = ctx or AgentContext()
 
     builder = StateGraph(AgentState)
+    builder.add_node("cache", _traced("cache", make_cache_node(ctx)))
     builder.add_node("understand", _traced("understand", make_understand_node(ctx)))
     builder.add_node("plan", _traced("plan", make_plan_node(ctx)))
     builder.add_node("clarify", _traced("clarify", make_clarify_node(ctx)))
@@ -423,7 +499,10 @@ def build_graph(ctx: Optional[AgentContext] = None, with_chart: bool = True,
     builder.add_node("answer", _traced("answer",
                                       make_answer_node(ctx, with_chart, with_insight)))
 
-    builder.add_edge(START, "understand")
+    builder.add_edge(START, "cache")
+    builder.add_conditional_edges(
+        "cache", route_after_cache,
+        {"execute": "execute", "understand": "understand"})
     builder.add_conditional_edges(
         "understand", route_after_understand,
         {"plan": "plan", "generate": "generate", "clarify": "clarify"})
@@ -536,6 +615,8 @@ class GraphAgent:
             peek_used=bool(state.get("peek_used")),
             peek_rows=int(state.get("peek_rows") or 0),
             peek_error=(state.get("peek_error") or "")[:80],
+            cache=bool(state.get("cache_hit")),
+            cache_note=(state.get("cache_note") or "")[:40],
             route=state.get("route", ""),
             retries=int(state.get("retry_count") or 0),
             rows=0 if result is None else int(len(result)),

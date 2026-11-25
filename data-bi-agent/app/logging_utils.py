@@ -131,6 +131,11 @@ TRACE_FIELDS = (
     ("peek_error", "peek_error", lambda v: str(v or "")[:80]),
     ("chart_type", "chart", str),
     ("lessons_used", "lessons", len),
+    # SQL 复用（P1）：只记"是否复用"与一句原因。原因里不含 SQL 全文，
+    # 它回答的是"这次为什么没复活"（问题变了 / 库变了 / 多轮 / 归因）。
+    ("cache_hit", "cache", bool),
+    ("cache_failed", "cache_failed", bool),
+    ("cache_note", "cache_note", lambda v: str(v or "")[:40]),
     ("errors", "errors", len),
     ("failed", "failed", bool),
     ("fallback", "fallback", bool),

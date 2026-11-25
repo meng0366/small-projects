@@ -180,6 +180,22 @@ _PATTERNS = [
 ]
 
 
+def has_relative_time(question: str) -> bool:
+    """问题里是否出现相对时间说法（不换算，只看有没有）。
+
+    给 SQL 复用判断"要不要把今天绑进缓存键"用：含相对时间的问题，SQL 里已经
+    被换算成显式日期区间，换一天再复用就是拿上个月的数冒充这个月。
+
+    刻意复用 `_PATTERNS` 同一份规则表，而不是另写一个关键词列表 ——
+    两处判据一旦分家就会漂移（"近两周"加进锚点、却忘了加进缓存键，
+    于是跨天复用一个错的 SQL，这种错还没有任何报错）。
+    """
+    text = (question or "").strip()
+    if not text:
+        return False
+    return any(regex.search(text) for _, regex in _PATTERNS)
+
+
 def resolve_time_anchor(question: str, today=None, coverage=None) -> list:
     """抽出问题里的相对时间，换算成显式日期区间。
 

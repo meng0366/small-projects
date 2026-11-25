@@ -12,6 +12,13 @@ from unittest import mock
 
 import pandas as pd
 
+try:
+    import _env  # noqa: F401  测试环境隔离（临时 AGENT_HOME、关闭 SQL 复用）
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+
 import app.agent as A
 import app.graph as G
 import app.nodes.plan as P

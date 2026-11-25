@@ -44,6 +44,13 @@ class AgentState(TypedDict, total=False):
     lessons_used: List[str]          # 本次注入了哪几条修正记录（P1-1，便于排查"为什么这次答对了"）
     result: Any                      # 执行结果（DataFrame）
 
+    # ---- SQL 复用（P1，2026-11-26）----
+    cache_hit: bool                  # 本次是否复用了历史 SQL（跳过了生成）
+    cache_failed: bool               # 复用的 SQL 跑不通（表/字段变了）→ 作废后重新生成，不换路
+    cache_note: str                  # 命中/未命中的一句话说明，给用户与日志看
+    cached_insight: str              # 上次的洞察文案；结果指纹不一致时会被清空
+    cached_hash: str                 # 上次结果表的指纹，用来判断"数据变了没"
+
     # ---- 两段式探查（P1，2026-11-25）----
     peek_used: bool                  # 模型是否要求过探查（要求了就算用掉额度，不管成没成）
     peek_note: str                   # 探查结果的一行摘要，给用户看"系统先看了一眼什么"

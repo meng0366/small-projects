@@ -9,6 +9,13 @@
 import unittest
 from unittest import mock
 
+try:
+    import _env  # noqa: F401  测试环境隔离（临时 AGENT_HOME、关闭 SQL 复用）
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+except ModuleNotFoundError:      # 以包方式运行（python -m unittest tests.test_xxx）
+    from . import _env  # noqa: F401
+
 import app.graph as G
 
 GOOD_SQL = ("SELECT c.region AS 区域, ROUND(SUM(o.amount), 2) AS 销售额 "

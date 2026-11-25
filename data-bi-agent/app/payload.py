@@ -123,6 +123,12 @@ def build_payload(state: dict, question: str, max_rows: int = 0) -> dict:
             "note": state.get("peek_note") or "",
             "error": state.get("peek_error") or "",
         },
+        # SQL 复用（P1）：调用方要能看出"这次的 SQL 是模型现写的还是复用的"，
+        # 前者可能受模型波动影响，后者是上次已经跑通过的那一条。
+        "cache": {
+            "hit": bool(state.get("cache_hit")),
+            "note": state.get("cache_note") or "",
+        },
         "ok": df is not None,
         "route": state.get("route") or "",
         "statement": state.get("statement") or "",

@@ -428,7 +428,11 @@ def main() -> None:
     # 默认**不带**修正记录（use_lessons=False）：基线要反映冷启动表现。
     # 一旦沉淀了 lesson 就自动变好，历史数字就再也比不了 —— 想测"沉淀之后有多好"
     # 就显式加 --with-lessons，那属于另一个口径。
-    ctx = AgentContext(use_lessons=args.with_lessons)
+    #
+    # **也关掉 SQL 复用**（use_cache=False）：评测里同一批问题会跑第二遍
+    # （重复跑校验稳定性、多轮调参），命中缓存等于让"上一轮的答案"给这一轮打分，
+    # 准确率虚高、token 统计也没法跟历史基线比 —— 冷启动口径必须每次都真跑。
+    ctx = AgentContext(use_lessons=args.with_lessons, use_cache=False)
     agent = GraphAgent(ctx, with_chart=args.with_chart, with_insight=args.with_insight,
                        max_retries=args.max_retries)
 
