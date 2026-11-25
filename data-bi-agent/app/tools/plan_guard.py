@@ -29,7 +29,7 @@ from calendar import monthrange
 from datetime import date
 from typing import Optional
 
-from app.tools.scope_guard import extract_anchors, strip_code_fence
+from app.tools.scope_guard import extract_anchors, half_months, strip_code_fence
 
 # 需要"先想清楚再写 SQL"的信号。都是为了压成本：简单问题（"各区域的销售额"）
 # 直接生成就够，多一次调用只是白白烧 token。
@@ -291,6 +291,22 @@ def validate_plan(plan: dict, tables: dict, enums: list = None,
                     f"你问的是 {'、'.join(str(m) for m in missing)} 月，"
                     f"计划里的时间区间（{start.isoformat()} ~ {end.isoformat()}）"
                     f"不包含这个月份。"))
+        # 半年：门槛是"别把范围放大"。上半年→全年、下半年→全年这类放宽，
+        # 数据一有就悄悄答完了，重试守卫（scope_guard）根本没机会出场。
+        for half_year, half in anchors.get("halves") or []:
+            if start is None or end is None or start.year != end.year:
+                continue          # 跨年区间的边界不好判，宁可不拦
+            if half_year is not None and half_year not in (start.year, end.year):
+                continue          # 年份已被上面的年份检查管住
+            lo, hi = half_months(half)
+            if start.month < lo or end.month > hi:
+                name = "上半年" if half == 1 else "下半年"
+                head = f"{half_year}年" if half_year else ""
+                issues.append(_issue(
+                    "fatal", "anchor",
+                    f"你问的是 {head}{name}（{lo}-{hi} 月），"
+                    f"计划里的时间却是 {start.isoformat()} ~ {end.isoformat()}，"
+                    f"覆盖的范围比这半年大。没有拿更宽的时段来代替 —— 那是换了个问题。"))
 
     # 5) 模型自己标注的假设：不阻断，但要让人看见
     for text in plan.get("assumptions") or []:

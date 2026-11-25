@@ -80,9 +80,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 """与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成；
-0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）。"""
+0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）；
+0.13.1 = 半年（上半年 / H1）纳入范围守卫，并修掉「今年上半年」被当成全年的锚点误判。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
                "teach", "t", "lessons", "ls", "catalog", "cat",

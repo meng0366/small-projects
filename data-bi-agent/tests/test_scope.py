@@ -183,6 +183,100 @@ class TestQuarterAnchors(unittest.TestCase):
                              [m.group(0) for m in ATTR_RE.finditer(text)], text)
 
 
+class TestHalfYearAnchors(unittest.TestCase):
+    """半年也要守（第九轮遗留项）。
+
+    以前「上半年」在 `extract_anchors` 里什么都抽不出来（没有年份数字、没有月份、
+    也不是「3-5 月」那种区间），把范围换成全年根本看不见 —— 第五节的脚注写着
+    "半年仍未纳入（漏判不误拦）"。补上之后，判法比季度更细：半年区间常常以
+    「下半天首月 1 日」为上界，那时 6 月/12 月根本不出现，只看月份会误拦。
+    """
+
+    H1 = "2025 年上半年的销售额是多少？"
+    H2 = "2025 年下半年的销售额是多少？"
+
+    def test_half_extracted(self):
+        self.assertEqual(extract_anchors(self.H1)["halves"], [(2025, 1)])
+        self.assertEqual(extract_anchors(self.H2)["halves"], [(2025, 2)])
+        self.assertEqual(extract_anchors("上半年的销售额")["halves"], [(None, 1)])
+        self.assertEqual(extract_anchors("2025 年上半年 1-6 月的销售额")["halves"], [(2025, 1)])
+
+    def test_expanded_months_is_fine(self):
+        sql = ("SELECT 1 FROM orders WHERE strftime('%Y-%m', order_date) IN "
+               "('2025-01','2025-02','2025-03','2025-04','2025-05','2025-06')")
+        self.assertEqual(check_scope(self.H1, sql), [])
+
+    def test_date_range_is_fine(self):
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2025-01-01' "
+               "AND order_date < '2025-07-01'")
+        self.assertEqual(check_scope(self.H1, sql), [])
+
+    def test_upper_bound_only_is_fine(self):
+        """年份在别处过滤、只卡上界 `<= '06'`：这时一月根本不出现，不能判成换范围。"""
+        sql = ("SELECT 1 FROM orders WHERE strftime('%Y', order_date) = '2025' "
+               "AND strftime('%m', order_date) <= '06'")
+        self.assertEqual(check_scope(self.H1, sql), [])
+        sql_h2 = ("SELECT 1 FROM orders WHERE strftime('%Y', order_date) = '2025' "
+                  "AND strftime('%m', order_date) >= '07'")
+        self.assertEqual(check_scope(self.H2, sql_h2), [])
+
+    def test_bare_month_numbers_are_fine(self):
+        for question, lo, hi in ((self.H1, 1, 6), (self.H2, 7, 12)):
+            sql = ("SELECT 1 FROM orders WHERE strftime('%Y', order_date) = '2025' "
+                   f"AND CAST(strftime('%m', order_date) AS INTEGER) BETWEEN {lo} AND {hi}")
+            with self.subTest(question=question):
+                self.assertEqual(check_scope(question, sql), [])
+
+    def test_half_literal_is_fine(self):
+        sql = ("SELECT 1 FROM orders WHERE strftime('%Y', order_date) || '-H1' "
+               "= '2025-H1'")
+        self.assertEqual(check_scope(self.H1, sql), [])
+
+    def test_widened_to_full_year_is_caught(self):
+        """上半年被放宽成全年：数据一有就悄悄答完了，最典型的一种。"""
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2025-01-01' "
+               "AND order_date < '2026-01-01'")
+        for question in (self.H1, self.H2):
+            with self.subTest(question=question):
+                problems = check_scope(question, sql)
+                self.assertTrue(any("半年" in p for p in problems), problems)
+
+    def test_narrowed_to_a_quarter_is_caught(self):
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2025-04-01' "
+               "AND order_date < '2025-07-01'")
+        problems = check_scope(self.H1, sql)
+        self.assertTrue(any("上半年" in p for p in problems), problems)
+
+    def test_swapped_half_is_caught(self):
+        """上下半年互换：上界/下界方向不同，不能都当"7 月还在"。"""
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2025-07-01' "
+               "AND order_date < '2026-01-01'")
+        problems = check_scope(self.H1, sql)
+        self.assertTrue(any("上半年" in p for p in problems), problems)
+
+        sql_h1 = ("SELECT 1 FROM orders WHERE strftime('%Y-%m', order_date) IN "
+                  "('2025-01','2025-02','2025-03','2025-04','2025-05','2025-06')")
+        problems = check_scope(self.H2, sql_h1)
+        self.assertTrue(any("下半年" in p for p in problems), problems)
+
+    def test_other_year_is_caught_by_year_anchor(self):
+        """换到别的年份时，边界年份本身也是线索，别被"7 月还在"糊过去。"""
+        sql = ("SELECT 1 FROM orders WHERE order_date >= '2024-07-01' "
+               "AND order_date < '2025-01-01'")
+        problems = check_scope(self.H2, sql)
+        self.assertTrue(problems)
+
+    def test_half_regex_matches_attribution(self):
+        """两处半年正则必须认同一批写法（同季度那条对拍用例）。"""
+        from app.tools.attribution import HALF_RE as ATTR_RE
+        from app.tools.scope_guard import _HALF_RE
+        samples = ["2025H1", "2025-H2", "上半年", "下半年", "2025 年下半年",
+                   "前半年", "Q2 比上半年", "H1 上半年"]
+        for text in samples:
+            self.assertEqual([m.group(0) for m in _HALF_RE.finditer(text)],
+                             [m.group(0) for m in ATTR_RE.finditer(text)], text)
+
+
 class TestScopeGuardInGraph(unittest.TestCase):
     """在状态机里验证：改条件的重试结果必须被丢掉。"""
 
@@ -205,6 +299,32 @@ class TestScopeGuardInGraph(unittest.TestCase):
         self.assertIn("2024", state["answer"])
         self.assertIn("没有拿别的范围顶替", state["answer"])
         # 不渲染空图空表
+        self.assertEqual(state["chart_type"], "none")
+
+    def test_half_widened_to_full_year_result_is_rejected(self):
+        """端到端：上半年空结果 → 重试放宽成全年并拿到数据 → 数据必须丢掉。
+
+        只验 `check_scope` 是不够的：真正拦人的是状态机里"执行后、结果非空"那一步。
+        """
+        h1_sql = "SELECT 1 FROM orders WHERE order_date <= '2025-06-30'"
+        full_sql = ("SELECT SUM(amount) FROM orders WHERE order_date >= '2025-01-01' "
+                    "AND order_date < '2026-01-01'")
+        frames = [pd.DataFrame(), pd.DataFrame({"销售额": [1.0]})]
+        agent = G.GraphAgent(with_chart=False, with_insight=False, max_retries=2)
+        call = {"n": 0}
+
+        def fake_run_sql(statement, db_path):
+            frame = frames[min(call["n"], 1)]
+            call["n"] += 1
+            return {"ok": True, "df": frame, "sql": statement, "rows": len(frame)}
+
+        with mock.patch.object(G, "generate_sql", side_effect=[h1_sql, full_sql]):
+            with mock.patch.object(G, "run_sql", side_effect=fake_run_sql):
+                state = agent.run("2025 年上半年的销售额是多少？")
+
+        self.assertIsNone(state.get("result"), "放宽成全年换来的数据必须丢掉")
+        self.assertTrue(state.get("scope_violation"))
+        self.assertIn("上半年", state["answer"])
         self.assertEqual(state["chart_type"], "none")
 
     def test_same_scope_empty_is_not_flagged(self):

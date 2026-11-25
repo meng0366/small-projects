@@ -22,7 +22,7 @@
 3. **无交集就是没有数据**，不许平移到有数据的区间（那是"换个问题再答"）。
    部分超出才按覆盖内的部分回答，并明说超出情况。
 4. 只做**公历自然周期**：上个月 = 上一自然月整月，最近 N 天含今天，
-   季度按自然季度。中文"去年""前天"等都按同一规则。
+   季度按自然季度，半年按自然半年（上半年 1-6 月）。中文"去年""前天"等都按同一规则。
 
 本模块是纯函数，不依赖 LLM / 数据库 / 配置。
 """
@@ -99,6 +99,13 @@ def _quarter_bounds(year: int, quarter: int) -> Tuple[date, date]:
     return _month_bounds(year, start_month)[0], _month_bounds(year, start_month + 2)[1]
 
 
+def _half_bounds(year: int, half: int) -> Tuple[date, date]:
+    """上半年 = 1-6 月，下半年 = 7-12 月，都按自然半年。"""
+    if half == 1:
+        return date(year, 1, 1), date(year, 6, 30)
+    return date(year, 7, 1), date(year, 12, 31)
+
+
 def _week_bounds(day: date) -> Tuple[date, date]:
     monday = day - timedelta(days=day.weekday())
     return monday, monday + timedelta(days=6)
@@ -153,6 +160,12 @@ _PATTERNS = [
     ("this_month", re.compile(r"(这个月|本月|当月|本月份)")),
     ("last_quarter", re.compile(r"(上个季度|上季度|上一个季度|前一?季度)")),
     ("this_quarter", re.compile(r"(这个季度|本季度|当季)")),
+    # 半年必须排在「去年/今年」之前：否则「今年上半年」里的「今年」先命中，
+    # 系统会把半年的问题按全年注入锚点 —— 比不认半年更糟（模型会照着答全年）。
+    # 只认带年份词的说法；裸「上半年」归 scope_guard 的字面锚点管，不在这里猜年份。
+    ("half_year", re.compile(
+        r"(?P<yp>今年|本年度|本年|上一年|上年|去年|前年)\s*(?:的)?\s*"
+        r"(?P<hp>上半年|下半年|前半年|后半年|H(?P<hn>[12])(?!\d))", re.IGNORECASE)),
     ("last_year", re.compile(r"(去年|上一年|前一年)")),
     ("this_year", re.compile(r"(今年|本年|本年度|当年)")),
     ("last_week", re.compile(r"(上周|上个星期|前一周)")),
@@ -208,6 +221,19 @@ def resolve_time_anchor(question: str, today=None, coverage=None) -> list:
             elif kind == "last_year_same":
                 y, m = _shift_month(base, -12)
                 s, e = _month_bounds(y, m)
+            elif kind == "half_year":
+                year_phrase = match.group("yp")
+                if year_phrase == "前年":
+                    year = base.year - 2
+                elif year_phrase in ("今年", "本年", "本年度"):
+                    year = base.year
+                else:
+                    year = base.year - 1
+                if match.group("hn"):
+                    half = int(match.group("hn"))
+                else:
+                    half = 1 if match.group("hp") in ("上半年", "前半年") else 2
+                s, e = _half_bounds(year, half)
             elif kind == "last_year":
                 s, e = date(base.year - 1, 1, 1), date(base.year - 1, 12, 31)
             elif kind == "this_year":

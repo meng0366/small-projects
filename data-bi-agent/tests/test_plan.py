@@ -222,6 +222,40 @@ class TestValidatePlan(unittest.TestCase):
         self.assertTrue(fatal)
         self.assertIn("6", fatal[0]["message"])
 
+    def test_half_year_widened_plan_is_fatal(self):
+        """用户问上半年，计划按全年算：数据一有就悄悄答完，重试守卫根本没机会出场。
+
+        这是半年在 scope_guard 之外补的第二道 —— 计划阶段零 token 就能拦住。
+        """
+        plan = plan_of(time_range={"column": "order_date",
+                                   "start": "2025-01-01", "end": "2025-12-31"})
+        issues = self._check(plan, question="2025 年上半年的销售额是多少？")
+        fatal = [i for i in issues if i["level"] == "fatal"]
+        self.assertTrue(fatal)
+        self.assertEqual(fatal[0]["kind"], "anchor")
+        self.assertIn("上半年", fatal[0]["message"])
+        self.assertIn("没有拿更宽的时段来代替", fatal[0]["message"])
+
+    def test_second_half_starting_in_january_is_fatal(self):
+        """下半年从 1 月起 = 范围被放大。方向不同，判据也不同。"""
+        plan = plan_of(time_range={"column": "order_date",
+                                   "start": "2025-01-01", "end": "2025-12-31"})
+        issues = self._check(plan, question="2025 年下半年的销售额是多少？")
+        self.assertTrue(any(i["kind"] == "anchor" and "下半年" in i["message"]
+                            for i in issues if i["level"] == "fatal"))
+
+    def test_half_year_exact_plan_passes(self):
+        plan = plan_of(time_range={"column": "order_date",
+                                   "start": "2025-01-01", "end": "2025-06-30"})
+        self.assertFalse(has_fatal(self._check(plan, question="2025 年上半年的销售额是多少？")))
+
+    def test_cross_year_plan_is_not_blocked_for_half(self):
+        """跨年区间不判半年：边界写法太多，宁可不拦（漏判优于误拦）。"""
+        plan = plan_of(time_range={"column": "order_date",
+                                   "start": "2025-07-01", "end": "2026-06-30"})
+        issues = self._check(plan, question="2025 年下半年的销售额是多少？")
+        self.assertFalse(any(i["kind"] == "anchor" for i in issues))
+
     def test_attribution_not_blocked_by_single_period(self):
         """归因比的是两期，计划只有一个区间 —— 不按单期校验，否则天天误拦。"""
         plan = plan_of(time_range={"column": "order_date",

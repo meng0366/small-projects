@@ -63,6 +63,37 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(last.span, (date(2025, 4, 1), date(2025, 6, 30)))
         self.assertEqual(this.span, (date(2025, 7, 1), date(2025, 9, 30)))
 
+    def test_half_year(self):
+        """半年必须换算出自然半年，且不能被「今年/去年」抢先按全年算。
+
+        「今年上半年」曾经命中的是 this_year，系统会注入「今年 = 全年」——
+        比不认半年更糟：模型会照着答全年，还理直气壮。
+        """
+        cases = [
+            ("今年上半年销售额", (date(2026, 1, 1), date(2026, 6, 30))),
+            ("今年下半年销售额", (date(2026, 7, 1), date(2026, 12, 31))),
+            ("去年上半年", (date(2025, 1, 1), date(2025, 6, 30))),
+            ("去年 下半年", (date(2025, 7, 1), date(2025, 12, 31))),
+            ("前年下半年订单", (date(2024, 7, 1), date(2024, 12, 31))),
+            ("去年 H2 的订单", (date(2025, 7, 1), date(2025, 12, 31))),
+        ]
+        for q, expected in cases:
+            with self.subTest(question=q):
+                found = resolve_time_anchor(q, today=TODAY, coverage={})
+                self.assertEqual(len(found), 1, found)
+                self.assertEqual(found[0].span, expected)
+
+    def test_half_year_wins_over_year_word(self):
+        """「去年上半年」不能再拆出一个「去年」，否则两个锚点互相矛盾。"""
+        found = resolve_time_anchor("去年上半年比今年上半年", today=TODAY, coverage={})
+        self.assertEqual([a.phrase for a in found], ["去年上半年", "今年上半年"])
+
+    def test_bare_half_year_has_no_anchor(self):
+        """裸「上半年」不猜年份：它本来就是字面条件，归 scope_guard 管。"""
+        for q in ["上半年的销售额", "2025 年上半年的销售额", "下半年订单"]:
+            with self.subTest(question=q):
+                self.assertEqual(resolve_time_anchor(q, today=TODAY, coverage=COVER), [])
+
     def test_year_and_this_month(self):
         cases = [
             ("去年销售额", (date(2025, 1, 1), date(2025, 12, 31))),

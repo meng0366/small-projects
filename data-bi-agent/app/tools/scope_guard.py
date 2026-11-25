@@ -14,8 +14,8 @@
 改年份/改月份/删掉用户明确要求的取值，都不是放宽，是换了个问题。
 
 提示词已同步收紧，但**提示词只能降概率**，所以这里再用代码兜一层：
-重试生成的语句里，用户原话中的年份、季度、月份（含「3-5 月」这种区间）、
-枚举取值必须仍然在。
+重试生成的语句里，用户原话中的年份、季度、半年（含「上半年」「H1」）、
+月份（含「3-5 月」这种区间）、枚举取值必须仍然在。
 """
 from __future__ import annotations
 
@@ -38,6 +38,15 @@ _QUARTER_RE = re.compile(
     re.IGNORECASE,
 )
 _CN_QUARTER = {"一": 1, "二": 2, "三": 3, "四": 4}
+# 半年：「上半年」「下半年」「H1」「H2」「2025 年下半年」。
+# 与 attribution.HALF_RE 是同一套写法（那边切时段，这边守范围），改一处要同步另一处，
+# tests/test_scope.py 里有对拍用例盯着。
+_HALF_RE = re.compile(
+    r"(?:(?P<y>\d{4})\s*(?:年|[-/])?\s*(?:的)?\s*)?"
+    r"(?:(?P<h1>[上下前后])半年|H(?P<h2>[12])(?![\d]))",
+    re.IGNORECASE,
+)
+_HALF_FIRST = {"上": 1, "前": 1, "下": 2, "后": 2}
 # 裸月份数字的上下文（`BETWEEN 4 AND 6`、`month = 6`、`IN (4,5,6)`）。
 # 必须挂在比较/区间关键词后面，孤零零的数字不算 —— `LIMIT 6` 不是六月。
 _BARE_MONTH_CTX = r"(?:between|and|>=|<=|>|<|=|,|\bin\s*\()\s*0?%d(?!\d)"
@@ -109,8 +118,38 @@ def _quarter_of(match) -> Optional[int]:
     return int(raw) if str(raw).isdigit() else _CN_QUARTER.get(str(raw))
 
 
+def half_months(half: int) -> tuple:
+    """上半年的月份区间 (1, 6)，下半年 (7, 12)。plan_guard 也用它，别各写一份。"""
+    return (1, 6) if half == 1 else (7, 12)
+
+
+def extract_halves(text: str) -> List[tuple]:
+    """抽出原话里的半年，返回 [(年 或 None, 1|2)]，按出现顺序、自动去重。
+
+    和季度同理：用户写「上半年」，模型可以写 `'2025-H1'`、`'上半年'`，
+    也可以展开成 `'2025-01'...'2025-06'` 或日期区间 `>= '2025-01-01' AND < '2025-07-01'`，
+    三种都算答对了。这里只负责"认出用户问的是哪半年"。
+    """
+    found: List[tuple] = []
+    for match in _HALF_RE.finditer(text or ""):
+        half = _half_of(match)
+        if not half:
+            continue
+        year = int(match.group("y")) if match.group("y") else None
+        if (year, half) not in found:
+            found.append((year, half))
+    return found
+
+
+def _half_of(match) -> Optional[int]:
+    raw = match.group("h1") or match.group("h2")
+    if raw is None:
+        return None
+    return int(raw) if str(raw).isdigit() else _HALF_FIRST.get(str(raw))
+
+
 def extract_anchors(question: str, enums: Optional[list] = None) -> dict:
-    """抽出用户原话里"不能动"的条件：年份、季度、月份区间、枚举取值。"""
+    """抽出用户原话里"不能动"的条件：年份、季度、半年、月份区间、枚举取值。"""
     text = question or ""
     spans = [(int(a), int(b)) for a, b in _SPAN_RE.findall(text) if int(a) <= int(b)]
     # 跨度里的月份不再单算锚点：'3-5 月' 会命中「5 月」，若既按单月又按区间各查一遍，
@@ -131,6 +170,7 @@ def extract_anchors(question: str, enums: Optional[list] = None) -> dict:
                     "value": value,
                 })
     return {"years": years, "quarters": extract_quarters(text),
+            "halves": extract_halves(text),
             "months": months, "spans": spans, "values": values}
 
 
@@ -183,6 +223,61 @@ def _quarter_present(year: Optional[int], quarter: int, body: str) -> bool:
     return _span_present(quarter * 3 - 2, quarter * 3, body)
 
 
+def _bound_month(month: int, lower: bool, body: str,
+                 year: Optional[int] = None) -> bool:
+    """语句里有没有「以某月为界」的比较：`>= '2025-07-01'` / `< '2025-07'`。
+
+    只问"这个月有没有出现过"是不够的：`< '2025-07-01'` 里的 7 月是**上界**
+    （意思是"到 6 月底"），而 `>= '2025-07-01'` 里的 7 月是**下界**（下半年的起点）。
+    方向不同，指的半年正好相反 —— 所以这两处必须分开看。
+
+    给了 `year` 时只认这一年（或不带年份的写法）：`>= '2024-07-01'` 拿来答
+    「2025 下半年」时，边界在 2024，不能算"下半年还在"。
+    """
+    op = r"(?:>=|>)" if lower else r"(?:<=|<)"
+    pattern = rf"{op}\s*'?(?:(\d{{4}})-)?0?{month}(?!\d)"
+    for match in re.finditer(pattern, body):
+        bound_year = match.group(1)
+        if year is None or bound_year is None or int(bound_year) == year:
+            return True
+    return False
+
+
+def _half_present(year: Optional[int], half: int, body: str) -> bool:
+    """这一半年是否还在语句里。
+
+    与季度同一套判法，几种等价写法都要放行：
+    - 字面：'2025-H1'、'上半年'
+    - 逐月展开：IN ('2025-01',...,'2025-06')
+    - 日期区间：>= '2025-01-01' AND < '2025-07-01'（上界写成下半年首月 1 日）
+    - 只卡上界：`strftime('%m') <= '06'`（年份在别处过滤，这时一月根本不出现）
+
+    最后一种是要紧的：一开始按"1 月必须出现"判，正确写法被判成"换了范围"。
+    拦错人比漏判更伤，所以判据改成"只要有一条落在这一半年内的证据就放行"。
+
+    也不能只看"6 月/12 月在不在"：上半年的日期区间以 7 月 1 日为上界，
+    那时语句里根本没有 6 月。所以 7 月要按**方向**认（`_bound_month`），
+    而且上界是 7 月时还得看下界 —— 下界落在 2-6 月的其实是某个季度。
+    """
+    for match in _HALF_RE.finditer(body):
+        if _half_of(match) != half:
+            continue
+        literal_year = match.group("y")
+        if year is None or literal_year is None or int(literal_year) == year:
+            return True
+    if half == 1:
+        if _month_present(6, body):
+            return True
+        if not _bound_month(7, False, body, year):
+            return False
+        # 上界是 7 月还要看下界：`>= '2025-04-01' AND < '2025-07-01'` 是 Q2，
+        # 不是上半年。下界落在 2-6 月就说明范围被缩小了。
+        return not any(_bound_month(m, True, body, year) for m in range(2, 7))
+    if _month_present(12, body):
+        return True
+    return _bound_month(7, True, body, year)
+
+
 def check_scope(question: str, statement: str, enums: Optional[list] = None) -> List[str]:
     """检查重试语句是否还在回答"用户问的那个范围"。
 
@@ -201,6 +296,13 @@ def check_scope(question: str, statement: str, enums: Optional[list] = None) -> 
             label = f"{year}年Q{quarter}" if year else f"Q{quarter}"
             problems.append(f"你问的是 {label}（{quarter * 3 - 2}-{quarter * 3} 月），"
                             f"重试的查询里已经找不到这一季度（被换成了别的时段）")
+    for year, half in anchors["halves"]:
+        if not _half_present(year, half, body):
+            start, end = half_months(half)
+            name = "上半年" if half == 1 else "下半年"
+            label = f"{year}年{name}" if year else name
+            problems.append(f"你问的是 {label}（{start}-{end} 月），"
+                            f"重试的查询里已经找不到这一半年（被换成了别的时段）")
     for month in anchors["months"]:
         if not _month_present(month, body):
             problems.append(f"你问的是 {month} 月，重试的查询里已经找不到 {month} 月")
