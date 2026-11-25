@@ -29,6 +29,11 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+# 最小权限：这两个作业只读代码、跑测试、构建镜像，不需要写回仓库。
+# 不写这段的话用的是仓库默认令牌权限（可能是可写），跑仓库代码的作业不应该拿写权限。
+permissions:
+  contents: read
+
 jobs:
   offline-tests:
     name: 离线测试（Python ${{ matrix.python-version }}）
