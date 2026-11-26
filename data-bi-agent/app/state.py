@@ -42,6 +42,10 @@ class AgentState(TypedDict, total=False):
     statement: str                   # 生成的 SQL 或 Python 代码
     statements: List[str]            # 历次生成的语句（判断"重试是否真的改过"，P0-1b）
     lessons_used: List[str]          # 本次注入了哪几条修正记录（P1-1，便于排查"为什么这次答对了"）
+    # 🟡 [B] 召回质量标量：top_score=命中的最高相关度，signature=是否靠库外口径词命中。
+    # 只用来事后判断"召回有没有帮到"，不进 Prompt。trace_fields 白名单会收它们。
+    recall_top_score: float
+    recall_signature: bool
     result: Any                      # 执行结果（DataFrame）
 
     # ---- SQL 复用（P1，2026-11-26）----

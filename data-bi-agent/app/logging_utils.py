@@ -131,6 +131,10 @@ TRACE_FIELDS = (
     ("peek_error", "peek_error", lambda v: str(v or "")[:80]),
     ("chart_type", "chart", str),
     ("lessons_used", "lessons", len),
+    # 🟡 [B] 召回质量：只记两个标量。问题的口径词本身是数据（可能是业务秘密），
+    # 所以只记"有没有靠库外词命中"这个布尔，不记具体词；分数保留两位够区分强弱。
+    ("recall_top_score", "recall_top", lambda v: round(float(v or 0), 2)),
+    ("recall_signature", "recall_sig", bool),
     # SQL 复用（P1）：只记"是否复用"与一句原因。原因里不含 SQL 全文，
     # 它回答的是"这次为什么没复活"（问题变了 / 库变了 / 多轮 / 归因）。
     ("cache_hit", "cache", bool),

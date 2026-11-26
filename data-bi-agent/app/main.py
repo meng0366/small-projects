@@ -161,6 +161,10 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "cache_note": state.get("cache_note") or "",
         "review_issues": state.get("review_issues") or [],
         "review_blocked": bool(state.get("review_blocked")),
+        # 🟡 [A3] 召回摘要：网页要能说明"这个数参考了哪条已确认口径"
+        "lessons_used": list(state.get("lessons_used") or []),
+        "recall_top_score": round(float(state.get("recall_top_score") or 0), 2),
+        "recall_signature": bool(state.get("recall_signature")),
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -201,6 +205,10 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
     meta = [ROUTE_LABEL.get(msg.get("route", ""), ""), f"{len(df)} 行 × {df.shape[1]} 列"]
     if msg.get("cache_hit"):
         meta.append("复用上次的查询")
+    # 🟡 [A3] 召回了才显示：id 是排查入口，分数说明这条口径有多贴合
+    if msg.get("lessons_used"):
+        meta.append("参考已确认口径 " + "、".join(msg["lessons_used"])
+                    + f"（相关度 {msg.get('recall_top_score', 0):.2f}）")
     if msg.get("retry"):
         meta.append(f"自动重试 {msg['retry']} 次后完成")
     st.caption("　|　".join(m for m in meta if m))

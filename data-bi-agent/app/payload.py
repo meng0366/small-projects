@@ -123,6 +123,13 @@ def build_payload(state: dict, question: str, max_rows: int = 0) -> dict:
             "note": state.get("peek_note") or "",
             "error": state.get("peek_error") or "",
         },
+        # 🟡 [A2] 修正回流召回：让 `-f json` 与 MCP 调用方看出"这次用了哪条已确认口径、
+        # 靠不靠得住"。只回 id + 问题原文 + 分数标量，不回 lesson 的 SQL（那已在 statement 里）。
+        "lessons": {
+            "used": list(state.get("lessons_used") or []),
+            "top_score": round(float(state.get("recall_top_score") or 0), 2),
+            "signature": bool(state.get("recall_signature")),
+        },
         # SQL 复用（P1）：调用方要能看出"这次的 SQL 是模型现写的还是复用的"，
         # 前者可能受模型波动影响，后者是上次已经跑通过的那一条。
         "cache": {

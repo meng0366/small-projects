@@ -29,6 +29,8 @@ from app.nodes.reflect import is_aggregate_empty, is_empty_result
 from app.schema.loader import DEFAULT_DB
 from app.tools.chart_tool import CHART_TYPE_LABEL, build_chart, save_chart
 from app.tools.enum_guard import build_clarify_answer
+# 🟡 [A1] 线性引擎此前完全没接修正回流召回：补上与状态机同源的选记录 + 质量标量
+from app.tools.lesson_store import recall_stats, select_lessons
 from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.sql_cache import (
     find_cached_sql,
@@ -66,6 +68,10 @@ class AskResult:
     # SQL 结构审查（P1）：block 不执行、保持 SQL 路线；warn 只提示
     review_issues: List[dict] = field(default_factory=list)
     review_blocked: bool = False
+    # 🟡 [A1/B] 修正回流召回：与状态机对齐，线性引擎此前这两项一直是空
+    lessons_used: List[str] = field(default_factory=list)
+    recall_top_score: float = 0.0
+    recall_signature: bool = False
 
     @property
     def ok(self) -> bool:
@@ -162,6 +168,10 @@ class DataAgent:
             "cache_note": res.cache_note,
             "review_issues": list(res.review_issues),
             "review_blocked": bool(res.review_blocked),
+            # 🟡 [A1/B] 与状态机同名字段，payload 与网页读同一处
+            "lessons_used": list(res.lessons_used),
+            "recall_top_score": float(res.recall_top_score),
+            "recall_signature": bool(res.recall_signature),
             "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
             "insight": res.refuse_reason or res.insight,
             "suggestions": [],
@@ -199,6 +209,20 @@ class DataAgent:
         terms = (self.terms + "\n\n" + hint).strip() if hint else self.terms
 
         use_sql = bool(self.db_path) and not force_pandas
+
+        # 🟡 [A1] 修正回流召回：与状态机 generate 节点同一套选法与同一处算质量。
+        # 一次问答只选一次（重试沿用），失败不能影响问答本身。
+        lessons = []
+        if self.ctx.use_lessons:
+            try:
+                lessons = select_lessons(question, self.ctx.lessons,
+                                         self.ctx.enums, self.ctx.terms_dict)
+            except Exception:
+                lessons = []
+        res.lessons_used = [item.get("id", "") for item in lessons]
+        quality = recall_stats(question, lessons, self.ctx.enums, self.ctx.terms_dict)
+        res.recall_top_score = quality["top_score"]
+        res.recall_signature = quality["signature"]
 
         # SQL 复用（P1）：命中就直接执行历史 SQL，跳过计划与生成。
         # 刻意放在计划之前 —— 计划要花一次调用，命中时先花这个钱就等于白省。
@@ -252,7 +276,8 @@ class DataAgent:
             plan_hint = plan_update.get("plan_hint") or ""
 
         if use_sql and res.df is None:
-            self._try_sql(question, res, terms=terms, plan_hint=plan_hint)
+            self._try_sql(question, res, terms=terms, plan_hint=plan_hint,
+                          lessons=lessons)
 
         # SQL 失败才回退 pandas；回退这件事本身要写进链里，否则看不出"为什么慢/为什么换了路线"
         # 结构审查拦下的语句不换路：问题在 SQL 写法，换 pandas 会把跨表题做成单表近似答案。
@@ -260,7 +285,7 @@ class DataAgent:
             and not res.review_blocked
         if res.df is None and not res.review_blocked:
             self._try_pandas(question, res, fallback=fallback, terms=terms,
-                             plan_hint=plan_hint)
+                             plan_hint=plan_hint, lessons=lessons)
 
         if res.df is not None:
             answered = time.perf_counter()
@@ -297,6 +322,10 @@ class DataAgent:
             peek_error=(res.peek.get("peek_error") or "")[:80],
             cache=bool(res.cache_hit),
             cache_note=(res.cache_note or "")[:40],
+            # 🟡 [B] 线性引擎汇总行也记召回质量，与状态机同字段口径
+            lessons=len(res.lessons_used),
+            recall_top=round(float(res.recall_top_score), 2),
+            recall_sig=bool(res.recall_signature),
             elapsed=round(time.perf_counter() - started, 2),
             question=(question or "")[:200],
             question_len=len(question or ""),
@@ -370,7 +399,8 @@ class DataAgent:
             pass          # 缓存是加速手段，写不进去不能影响这次回答
 
     def _try_sql(self, question: str, res: AskResult, terms: str = None,
-                 plan_hint: str = "", review_retry: bool = False) -> None:
+                 plan_hint: str = "", review_retry: bool = False,
+                 lessons: list = None) -> None:
         trace = res.trace_id
         hint = plan_hint
         if not self.ctx.use_peek:
@@ -378,8 +408,9 @@ class DataAgent:
 
         def _generate(extra: str = "") -> str:
             merged = (hint + "\n\n" + extra).strip() if hint else extra
+            # 🟡 [A1] 与状态机一致：召回的 lesson 拼进 Prompt 再生成
             return generate_sql(self.db_schema, terms or self.terms, question,
-                                plan_hint=merged)
+                                lessons=lessons, plan_hint=merged)
 
         started = time.perf_counter()
         try:
@@ -426,7 +457,7 @@ class DataAgent:
                                          failed=True, review_blocked=True))
                 if not review_retry:
                     return self._try_sql(
-                        question, res, terms=terms,
+                        question, res, terms=terms, lessons=lessons,
                         plan_hint=(plan_hint + "\n\n" + feedback).strip()
                         if plan_hint else feedback,
                         review_retry=True)
@@ -448,12 +479,14 @@ class DataAgent:
                       **trace_fields({"route": "sql", "error": msg}, failed=True))
 
     def _try_pandas(self, question: str, res: AskResult, fallback: bool = False,
-                    terms: str = None, plan_hint: str = "") -> None:
+                    terms: str = None, plan_hint: str = "",
+                    lessons: list = None) -> None:
         trace = res.trace_id
         started = time.perf_counter()
         try:
+            # 🟡 [A1] pandas 路线同样吃召回结果（generate_code 原本就收 lessons）
             code = generate_code(self.df_schema, terms or self.terms, question,
-                                 plan_hint=plan_hint)
+                                 lessons=lessons, plan_hint=plan_hint)
         except Exception as e:
             msg = f"代码生成失败：{type(e).__name__}: {e}"
             res.errors.append(msg)

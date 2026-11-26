@@ -46,7 +46,7 @@ from app.state import AgentState
 from app.tools.chart_tool import build_chart, save_chart
 from app.tools.attribution import attribution_chart_frame, decompose
 from app.tools.enum_guard import build_clarify_answer
-from app.tools.lesson_store import select_lessons
+from app.tools.lesson_store import recall_stats, select_lessons
 from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
 from app.tools.sql_cache import forget_sql, remember_sql, result_fingerprint
@@ -79,6 +79,8 @@ def make_generate_node(ctx: AgentContext):
             except Exception:
                 lessons = []      # 沉淀层出问题不能影响问答本身
         used = [item.get("id", "") for item in lessons]
+        # 🟡 [B] 召回质量标量：与 lessons 同一处算，重试时沿用同一份（不重复算分）
+        stats = recall_stats(question, lessons, ctx.enums, ctx.terms_dict)
 
         intent = state.get("attribution_intent")
         # 计划先行（P1）：计划已通过代码校验，拼在问题后面一起下发。
@@ -110,7 +112,7 @@ def make_generate_node(ctx: AgentContext):
             statement = _generate()
         except Exception as e:
             return {"statement": "", "error": f"生成失败：{type(e).__name__}: {e}",
-                    "lessons_used": used}
+                    "lessons_used": used, **stats}
 
         # 两段式探查（P1）：模型若先要"看一眼真实取值"，这里执行一次并把结果回灌，
         # 再让它写最终 SQL。额度按整次问答算（`peek_used` 进 state），重试时不再探。
@@ -121,7 +123,7 @@ def make_generate_node(ctx: AgentContext):
             remaining=0 if state.get("peek_used") else MAX_PEEKS)
 
         # 审查结论属于"上一条语句"：换成新语句时先清掉，免得重试成功后还挂着旧提示
-        update = {**peek_update, "statement": statement, "lessons_used": used,
+        update = {**peek_update, "statement": statement, "lessons_used": used, **stats,
                   "review_issues": [], "review_blocked": False}
         if not statement:
             # 探查后重新生成失败：交给重试环，绝不能把 `PEEK:` 那行当 SQL 去执行
@@ -641,6 +643,9 @@ class GraphAgent:
             rows=0 if result is None else int(len(result)),
             empty=is_empty_result(result) or is_aggregate_empty(result),
             lessons=len(state.get("lessons_used") or []),
+            # 🟡 [B] 召回质量：汇总行也记，方便 `logs` 直接看出这次召回强不强
+            recall_top=round(float(state.get("recall_top_score") or 0), 2),
+            recall_sig=bool(state.get("recall_signature")),
             chart=state.get("chart_type", ""),
             elapsed=round(time.perf_counter() - started, 2),
             question=raw_question[:200],

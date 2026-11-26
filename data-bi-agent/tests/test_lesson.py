@@ -280,5 +280,79 @@ class TestEndToEnd(_TempHome):
         self.assertEqual(state["lessons_used"], [])
 
 
+class TestRecallVisibility(_TempHome):
+    """A/B 补链：线性引擎也接入召回，且质量标量在两引擎、payload、日志里口径一致。"""
+
+    def test_linear_engine_injects_lessons_like_graph(self):
+        """线性引擎此前完全不召回；补上后应与状态机注入同一条 lesson。"""
+        L.add_lesson("华南的销售额是多少？", SQL_GOOD, ctx=self.ctx)
+        captured = {}
+
+        def fake_generate_sql(schema, terms, question, previous_error=None,
+                              previous_empty=False, lessons=None, plan_hint=""):
+            captured["lessons"] = lessons
+            return SQL_GOOD
+
+        import app.agent as A
+        agent = A.DataAgent(ctx=self.ctx, with_chart=False, with_insight=False)
+        with mock.patch.object(A, "generate_sql", side_effect=fake_generate_sql), \
+                mock.patch.object(A, "run_sql",
+                                  return_value={"ok": True, "df": pd.DataFrame({"销售额": [1.0]}),
+                                                "sql": SQL_GOOD, "rows": 1}):
+            res = agent.ask("华南地区的销售额是多少？")
+
+        self.assertEqual([item["id"] for item in captured["lessons"]], ["L001"])
+        self.assertEqual(res.lessons_used, ["L001"])
+        # run() 是把 AskResult 转成 state 的桥，payload/网页都读它
+        self.assertEqual(agent.run("华南地区的销售额是多少？")["lessons_used"], ["L001"])
+
+    def test_unrelated_question_no_recall_in_linear(self):
+        """无关问题不该注入，质量标量归零。"""
+        L.add_lesson("华南的销售额是多少？", SQL_GOOD, ctx=self.ctx)
+
+        import app.agent as A
+        agent = A.DataAgent(ctx=self.ctx, with_chart=False, with_insight=False)
+        with mock.patch.object(A, "generate_sql", return_value=SQL_GOOD), \
+                mock.patch.object(A, "run_sql",
+                                  return_value={"ok": True, "df": pd.DataFrame({"销售额": [1.0]}),
+                                                "sql": SQL_GOOD, "rows": 1}):
+            res = agent.ask("每个月的销售额走势如何？")
+
+        self.assertEqual(res.lessons_used, [])
+        self.assertEqual(res.recall_top_score, 0.0)
+        self.assertFalse(res.recall_signature)
+
+    def test_recall_stats_top_score_and_signature(self):
+        """库外口径词命中要有 signature=True；纯字面相似则不算。"""
+        picked = [{"id": "L001", "question": "一共成交了多少大单"}]
+        stats = L.recall_stats("大单主要来自哪些品类？", picked,
+                               self.ctx.enums, self.ctx.terms_dict)
+        self.assertGreaterEqual(stats["top_score"], 0.42)
+        self.assertTrue(stats["signature"])
+        self.assertEqual(L.recall_stats("任意问题", []),
+                         {"top_score": 0.0, "signature": False})
+
+    def test_payload_exposes_recall(self):
+        """`-f json` 与 MCP 调用方能读到召回摘要。"""
+        from app.payload import build_payload
+        state = {"lessons_used": ["L001"],
+                 "recall_top_score": 0.85, "recall_signature": True,
+                 "result": pd.DataFrame({"销售额": [1.0]})}
+        lessons = build_payload(state, "q")["lessons"]
+        self.assertEqual(lessons["used"], ["L001"])
+        self.assertEqual(lessons["top_score"], 0.85)
+        self.assertTrue(lessons["signature"])
+
+    def test_trace_fields_include_recall_scalars(self):
+        """日志白名单收下两个标量，且不把口径词原文写进日志。"""
+        from app.logging_utils import trace_fields
+        fields = trace_fields({"recall_top_score": 0.85321,
+                               "recall_signature": True})
+        self.assertEqual(fields["recall_top"], 0.85)
+        self.assertTrue(fields["recall_sig"])
+        self.assertFalse(any("signature" in k or "词" in str(v)
+                             for k, v in fields.items()))
+
+
 if __name__ == "__main__":
     unittest.main()

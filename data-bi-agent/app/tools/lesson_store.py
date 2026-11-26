@@ -472,3 +472,27 @@ def select_lessons(question: str, lessons: List[dict], enums: Optional[list] = N
         picked.append(lesson)
         used += cost
     return picked
+
+
+# 🟡 [B] 召回可观测性：不挑记录、不算分给模型看，只把"这次召回到了什么"变成标量
+def recall_stats(question: str, picked: List[dict], enums: Optional[list] = None,
+                 terms: Optional[dict] = None) -> dict:
+    """本次召回的可观测标量（不进 Prompt，只进 state / 日志 / payload）。
+
+    回答两个"事后能不能查"的问题：
+    - `top_score`：命中的最高相关度。召回发生但分数刚过 0.42 门槛，和
+      分数 0.95 的几乎同源，是两种完全不同的信号；只看"注入了几条"分不出来。
+    - `signature`：命中的是不是**库外口径词**（"大单"这类）。这是 lesson
+      真正不可替代的价值 —— 库内词本就在 catalog 里，靠 schema 就能答对。
+
+    用纯函数实现、只吃 `select_lessons` 已经挑好的结果：改这里不用动挑算法的
+    签名（它有 5 个消费者，签名一改 mock 全得同步）。
+    """
+    if not picked:
+        return {"top_score": 0.0, "signature": False}
+    scores = [score_lesson(question, item, enums, terms) for item in picked]
+    known = known_words(enums, terms)
+    q_sig = signature_words(question, known)
+    hit_signature = any(bool(q_sig & signature_words(item.get("question", ""), known))
+                        for item in picked)
+    return {"top_score": round(max(scores), 4), "signature": bool(hit_signature)}
