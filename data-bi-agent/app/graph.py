@@ -50,6 +50,7 @@ from app.tools.lesson_store import select_lessons
 from app.tools.peek import MAX_PEEKS, PEEK_OFF_NOTE, maybe_peek
 from app.tools.scope_guard import check_scope, looks_like_sql, parse_defer
 from app.tools.sql_cache import forget_sql, remember_sql, result_fingerprint
+from app.tools.sql_review import format_review_for_model, review_sql
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -119,7 +120,9 @@ def make_generate_node(ctx: AgentContext):
             trace_id=state.get("trace_id", ""),
             remaining=0 if state.get("peek_used") else MAX_PEEKS)
 
-        update = {**peek_update, "statement": statement, "lessons_used": used}
+        # 审查结论属于"上一条语句"：换成新语句时先清掉，免得重试成功后还挂着旧提示
+        update = {**peek_update, "statement": statement, "lessons_used": used,
+                  "review_issues": [], "review_blocked": False}
         if not statement:
             # 探查后重新生成失败：交给重试环，绝不能把 `PEEK:` 那行当 SQL 去执行
             update["error"] = (peek_update.get("peek_error")
@@ -185,6 +188,21 @@ def make_execute_node(ctx: AgentContext):
         question = state.get("rewritten_question") or state.get("question", "")
 
         if state.get("route") == "sql" and ctx.has_db:
+            # 结构审查放在所有入口的汇合处：模型现写的、缓存里复用的、人工 teach 的
+            # 都要过这一关。纯函数、零 token；block 不执行、把原因回喂给模型改写，
+            # warn 只写进 state 供 CLI / 网页展示（可能是对的，拦错比漏判更伤）。
+            review_update = {}
+            if ctx.use_review:
+                try:
+                    review = review_sql(statement, ctx.db_unique_keys)
+                    if review["issues"]:
+                        review_update["review_issues"] = review["issues"]
+                    if not review["ok"]:
+                        return {"result": None,
+                                "error": format_review_for_model(review["issues"]),
+                                "review_blocked": True, **review_update, **history}
+                except Exception:
+                    pass  # 审查器是加法，自身异常不能挡住本来能跑的查询
             r = run_sql(statement, ctx.db_path)
             if r["ok"]:
                 frame = r["df"]
@@ -193,9 +211,10 @@ def make_execute_node(ctx: AgentContext):
                 if problems:
                     # 拿到了数据，但是靠改动用户的条件换来的（如 2024→2025）→ 丢掉，不许用
                     return {"result": None, "defer": "；".join(problems),
-                            "scope_violation": problems, **history}
+                            "scope_violation": problems, **review_update, **history}
                 update = {"result": frame, "error": None,
-                          "empty_result": is_empty_result(frame), **history}
+                          "empty_result": is_empty_result(frame),
+                          **review_update, **history}
                 update.update(_reuse_update(state, frame))
                 return update
             if state.get("cache_hit"):

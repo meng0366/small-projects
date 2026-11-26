@@ -58,6 +58,10 @@ class AgentState(TypedDict, total=False):
     peek_error: str                  # 探查被拒或执行失败的原因
     peek_ms: int                     # 探查 + 重新生成的耗时（毫秒），记在 generate 事件里
 
+    # ---- SQL 结构审查（P1，2026-11-26）----
+    review_issues: List[dict]        # 结构审查发现的问题（block 拦截 / warn 提示）
+    review_blocked: bool             # 因结构问题被拦下（不执行）；重试时保持 SQL 路线
+
     # ---- 错误与重试 ----
     error: str                       # 最近一次错误
     errors: List[str]                # 历史错误（供反思与排查）

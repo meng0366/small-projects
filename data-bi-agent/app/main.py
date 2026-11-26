@@ -105,6 +105,10 @@ def render_sidebar(ctx: AgentContext) -> tuple:
             "允许先看一眼真实取值（两段式探查）", value=ctx.use_peek,
             help="模型对某列的取值没把握时，可以先只读地看一眼真实数据再写 SQL，"
                  "避免把「已完成」猜成「completed」这种猜错字面量的情况。")
+        ctx.use_review = st.toggle(
+            "审查 SQL 结构（零模型调用）", value=ctx.use_review,
+            help="拦下会产生笛卡尔积的 SQL 并让模型改写；对 SELECT * 和非唯一键关联"
+                 "只给提示、不拦截。")
 
         st.divider()
         st.subheader("示例问题")
@@ -155,6 +159,8 @@ def answer_question(agent: GraphAgent, question: str) -> None:
         "peek_error": state.get("peek_error") or "",
         "cache_hit": bool(state.get("cache_hit")),
         "cache_note": state.get("cache_note") or "",
+        "review_issues": state.get("review_issues") or [],
+        "review_blocked": bool(state.get("review_blocked")),
         "errors": state.get("errors") or [],
         "retry": state.get("retry_count", 0),
         "deferred": bool(state.get("defer")),
@@ -230,6 +236,14 @@ def render_assistant(msg: dict, show_chart: bool, show_code: bool, idx: int = 0)
                 st.caption(f"探查：{note}")
             elif msg.get("peek_error"):
                 st.caption(f"探查未成功：{msg['peek_error']}")
+
+        # 结构审查的 warn：结果可能是对的，但值得让用户知道风险在哪
+        review_warns = [
+            issue.get("message", "") for issue in (msg.get("review_issues") or [])
+            if isinstance(issue, dict) and issue.get("level") == "warn"
+        ]
+        if review_warns:
+            st.caption("结构审查提示：" + "；".join(review_warns))
 
         if att.get("ok"):
             st.caption(f"归因明细：「{att.get('current_label')}」对比"

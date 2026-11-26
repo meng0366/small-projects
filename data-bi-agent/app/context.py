@@ -19,6 +19,7 @@ from app.schema.loader import (
     build_schema_text,
     collect_data_profile,
     describe_tables,
+    describe_unique_keys,
     format_data_profile,
     get_db_path,
     load_catalog,
@@ -28,6 +29,11 @@ from app.schema.loader import (
 from app.tools.lesson_store import known_words as lesson_known_words
 from app.tools.lesson_store import load_lessons
 from app.tools.time_anchor import resolve_time_anchor
+
+
+def _review_default() -> bool:
+    """默认是否做 SQL 结构审查（P1）。`AGENT_SQL_REVIEW=0` 关掉。"""
+    return os.getenv("AGENT_SQL_REVIEW", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _cache_default() -> bool:
@@ -51,6 +57,9 @@ class AgentContext:
     use_peek: bool = True            # 是否允许两段式探查（P1）；只在模型不确定取值时才多一次调用
     # 是否复用同一问题的历史 SQL（P1）；`AGENT_CACHE=0` 或 `--no-cache` 可关
     use_cache: bool = field(default_factory=_cache_default)
+    # 是否审查 SQL 结构（P1）：笛卡尔积拦截、SELECT * 与非唯一键关联提示；
+    # `AGENT_SQL_REVIEW=0` 或 `--no-review` 可关（关掉后只省一次纯函数检查）
+    use_review: bool = field(default_factory=_review_default)
 
     @cached_property
     def db_path(self) -> Optional[str]:
@@ -88,6 +97,15 @@ class AgentContext:
         改一次文案就会让反解失效，而校验悄无声息地不再生效是最难发现的那类退化。
         """
         return describe_tables(self.db_path) if self.db_path else {}
+
+    @cached_property
+    def db_unique_keys(self) -> dict:
+        """`{表名: {唯一列}}`：结构审查判断 JOIN 是否非唯一键关联的依据。
+
+        与 db_columns 分开：唯一性既来自建表约束，也来自 catalog 的 ref / 多对一声明，
+        变更文案不会影响它；空字典表示"不知道"，审查器对此不报非唯一键问题。
+        """
+        return describe_unique_keys(self.db_path, self.catalog) if self.db_path else {}
 
     @cached_property
     def df_columns(self) -> dict:

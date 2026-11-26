@@ -73,6 +73,7 @@ from app.tools.lesson_store import (
     select_lessons,
 )
 from app.tools.plan_guard import format_plan_summary
+from app.tools.sql_review import format_review_note
 
 # Windows 控制台默认可能是 GBK，强制 UTF-8 输出，避免中文打印报 UnicodeEncodeError
 if hasattr(sys.stdout, "reconfigure"):
@@ -80,11 +81,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 """与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成；
 0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）；
 0.13.1 = 半年（上半年 / H1）纳入范围守卫，并修掉「今年上半年」被当成全年的锚点误判；
-0.14 = 提示词去重：schema / 术语只注入一次（输入 token -49.4%），行为不变。"""
+0.14 = 提示词去重：schema / 术语只注入一次（输入 token -49.4%），行为不变；
+0.15 = 同问题复用历史 SQL（0 次模型调用）；0.16 = SQL 结构审查（笛卡尔积拦截 + 结构风险提示）。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
                "teach", "t", "lessons", "ls", "catalog", "cat",
@@ -128,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="不允许两段式探查（模型不确定取值时先看一眼真实数据）")
         p.add_argument("--no-cache", action="store_true",
                        help="不复用历史 SQL（每次都让模型重写；调整口径、排查异常时用）")
+        p.add_argument("--no-review", action="store_true",
+                       help="不做 SQL 结构审查（默认会拦笛卡尔积、提示 SELECT * 与非唯一键关联）")
         p.add_argument("--linear", action="store_true", help="用线性编排（无重试、无多轮记忆）")
         p.add_argument("--pandas", action="store_true", help="线性模式下强制走单表 pandas")
 
@@ -221,8 +225,9 @@ def make_context(args) -> AgentContext:
     use_plan = not getattr(args, "no_plan", False)
     use_peek = not getattr(args, "no_peek", False)
     use_cache = not getattr(args, "no_cache", False)
+    use_review = not getattr(args, "no_review", False)
     return AgentContext(db_file=db_file, use_plan=use_plan, use_peek=use_peek,
-                        use_cache=use_cache)
+                        use_cache=use_cache, use_review=use_review)
 
 
 def build_agent(args):
@@ -327,6 +332,10 @@ def _print_human(state: dict, question: str, quiet: bool = False) -> None:
         label = "SQL" if route == "sql" else "代码"
         print(f"\n[生成的{label}]")
         print(statement)
+        # 结构审查只有 warn 会走到这里（block 的语句根本没执行，走上面的失败分支）
+        review_note = format_review_note(state.get("review_issues") or [])
+        if review_note:
+            print(f"[{review_note}]")
 
     print(f"\n[分析结果]（{len(df)} 行）")
     if len(df) == 0:

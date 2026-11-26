@@ -95,8 +95,10 @@ def make_reflect_node(ctx: AgentContext, fallback_route: str = FALLBACK_ROUTE):
         # 只有真正的报错才触发换路（SQL 出错 → pandas）。
         # 但"复用的 SQL 过时"（cache_failed）也不换路：那是表结构/字段变了，
         # 换成 pandas 会绕开 JOIN 与聚合能力，正确的处置是重新生成一条 SQL。
+        # 结构审查拦下的语句同理（review_blocked）：问题在 SQL 写法，不在能力，
+        # 换到 pandas 会把跨表问题做成单表近似答案 —— 那比报错更危险。
         if not empty and current_route == "sql" and ctx.has_db \
-                and not state.get("cache_failed"):
+                and not state.get("cache_failed") and not state.get("review_blocked"):
             next_route = fallback_route
 
         update = {

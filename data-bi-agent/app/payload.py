@@ -129,6 +129,17 @@ def build_payload(state: dict, question: str, max_rows: int = 0) -> dict:
             "hit": bool(state.get("cache_hit")),
             "note": state.get("cache_note") or "",
         },
+        # SQL 结构审查（P1）：block 的问题不会执行，warn 只是风险提示。
+        # 调用方（尤其另一个 Agent）应据此判断这份数据可信度。
+        "review": {
+            "blocked": bool(state.get("review_blocked")),
+            "issues": [
+                {"code": item.get("code", ""), "level": item.get("level", ""),
+                 "message": item.get("message", "")}
+                for item in (state.get("review_issues") or [])
+                if isinstance(item, dict)
+            ],
+        },
         "ok": df is not None,
         "route": state.get("route") or "",
         "statement": state.get("statement") or "",

@@ -136,6 +136,9 @@ TRACE_FIELDS = (
     ("cache_hit", "cache", bool),
     ("cache_failed", "cache_failed", bool),
     ("cache_note", "cache_note", lambda v: str(v or "")[:40]),
+    # SQL 结构审查（P1）：只记发生与否和条数，审查意见里含 SQL 结构细节，不进日志
+    ("review_blocked", "review_blocked", bool),
+    ("review_issues", "review_issues", len),
     ("errors", "errors", len),
     ("failed", "failed", bool),
     ("fallback", "fallback", bool),

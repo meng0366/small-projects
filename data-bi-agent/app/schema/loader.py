@@ -12,6 +12,7 @@
 - WrenAI 的"上下文层"：把枚举值、单位、join 关系显式给出，显著降低模型臆造字段的概率。
 """
 import os
+import re
 import sqlite3
 
 import pandas as pd
@@ -157,6 +158,63 @@ def describe_tables(db_path: str) -> dict:
                 for table in list_tables(db_path)}
     except sqlite3.Error:
         return {}
+
+
+def describe_unique_keys(db_path: str, catalog: dict = None) -> dict:
+    """`{表名: {列名}}`：该列**能唯一标识一行**，供 SQL 结构审查判断 JOIN 粒度。
+
+    唯一性有四个来源，优先级从硬到软：
+    1. 主键（单列；复合主键不算 —— 单独拿一列并不唯一）；
+    2. 单列 UNIQUE 索引；
+    3. `catalog.yaml` 里别的列 `ref` 指向它（主数据编号，如 customers.customer_id）；
+    4. relationships 里标注「多对一 / 一对一」的右侧列。
+
+    为什么不能只看数据库约束：示例库（以及很多业务库）压根没建主键，
+    但词典里明确写了 `orders.customer_id -> customers.customer_id (多对一)`，
+    这就是"右侧唯一"的可靠声明。反过来，光看列名像 ID 就当唯一会误判，
+    所以只认声明，不猜。
+
+    返回的是集合，调用方只用它判断"JOIN 两侧是否都不是唯一键"——
+    一侧唯一就放行（正常的多对一），两侧都唯一也放行（一对一）。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    catalog = catalog if catalog is not None else load_catalog()
+    unique = {}
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            for table in list_tables(db_path):
+                pk_rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+                pk = [r[1] for r in pk_rows if int(r[5] or 0) > 0]
+                # 复合主键的每一列单独都不唯一，不能算进来
+                if len(pk) == 1:
+                    unique.setdefault(table, set()).add(pk[0])
+                for idx in con.execute(f'PRAGMA index_list("{table}")').fetchall():
+                    if not idx[2]:  # unique 标志
+                        continue
+                    indexed = [r[2] for r in con.execute(
+                        f'PRAGMA index_info("{idx[1]}")').fetchall() if r[2]]
+                    if len(indexed) == 1:
+                        unique.setdefault(table, set()).add(indexed[0])
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass  # 拿不到约束信息时退回词典声明，不能让审查器整体失效
+
+    for table_meta in catalog.get("tables") or []:
+        table = table_meta.get("name")
+        for col, meta in (table_meta.get("columns") or {}).items():
+            ref = meta.get("ref") if isinstance(meta, dict) else None
+            if not ref or "." not in str(ref):
+                continue
+            ref_table, ref_col = str(ref).split(".", 1)
+            unique.setdefault(ref_table, set()).add(ref_col)
+    for rel in catalog.get("relationships") or []:
+        m = re.match(r"\s*(\w+)\.(\w+)\s*->\s*(\w+)\.(\w+)\s*\(([^)]*)\)", str(rel))
+        if m and ("多对一" in m.group(5) or "一对一" in m.group(5)):
+            unique.setdefault(m.group(3), set()).add(m.group(4))
+    return unique
 
 
 def _table_row_count(db_path: str, table: str) -> int:

@@ -37,6 +37,7 @@ from app.tools.sql_cache import (
     result_fingerprint,
 )
 from app.tools.time_anchor import format_time_hint, out_of_range_answer
+from app.tools.sql_review import format_review_for_model, review_sql
 from app.tools.sql_tool import run_sql
 from app.tools.suggest_tool import suggest_followups
 
@@ -62,6 +63,9 @@ class AskResult:
     cache_hit: bool = False
     cache_note: str = ""
     cached_insight: str = ""        # 上次的洞察文案（结果指纹一致时才填）
+    # SQL 结构审查（P1）：block 不执行、保持 SQL 路线；warn 只提示
+    review_issues: List[dict] = field(default_factory=list)
+    review_blocked: bool = False
 
     @property
     def ok(self) -> bool:
@@ -156,6 +160,8 @@ class DataAgent:
             "peek_ms": int(res.peek.get("peek_ms") or 0),
             "cache_hit": bool(res.cache_hit),
             "cache_note": res.cache_note,
+            "review_issues": list(res.review_issues),
+            "review_blocked": bool(res.review_blocked),
             "answer": (res.refuse_reason or ("" if res.ok else "未能完成分析。")),
             "insight": res.refuse_reason or res.insight,
             "suggestions": [],
@@ -249,8 +255,10 @@ class DataAgent:
             self._try_sql(question, res, terms=terms, plan_hint=plan_hint)
 
         # SQL 失败才回退 pandas；回退这件事本身要写进链里，否则看不出"为什么慢/为什么换了路线"
-        fallback = res.df is None and bool(self.db_path) and not force_pandas
-        if res.df is None:
+        # 结构审查拦下的语句不换路：问题在 SQL 写法，换 pandas 会把跨表题做成单表近似答案。
+        fallback = res.df is None and bool(self.db_path) and not force_pandas \
+            and not res.review_blocked
+        if res.df is None and not res.review_blocked:
             self._try_pandas(question, res, fallback=fallback, terms=terms,
                              plan_hint=plan_hint)
 
@@ -306,6 +314,23 @@ class DataAgent:
         trace = res.trace_id
         sql = str(entry.get("sql") or "")
         started = time.perf_counter()
+        if self.ctx.use_review:
+            try:
+                review = review_sql(sql, self.ctx.db_unique_keys)
+                res.review_issues = list(review["issues"])
+                if not review["ok"]:
+                    # 缓存里的语句有结构问题：作废后重新生成，别每次命中都白跑一次
+                    forget_sql(question, self.ctx)
+                    msg = "复用的 SQL 未通过结构审查：" + format_review_for_model(
+                        review["issues"])
+                    res.errors.append(msg)
+                    log_event(trace, "execute",
+                              ms=round((time.perf_counter() - started) * 1000),
+                              **trace_fields({"route": "sql", "error": msg},
+                                             failed=True, review_blocked=True))
+                    return False
+            except Exception:
+                pass  # 审查器自身异常不能让缓存失效
         r = run_sql(sql, self.db_path)
         if not r["ok"]:
             forget_sql(question, self.ctx)
@@ -345,7 +370,7 @@ class DataAgent:
             pass          # 缓存是加速手段，写不进去不能影响这次回答
 
     def _try_sql(self, question: str, res: AskResult, terms: str = None,
-                 plan_hint: str = "") -> None:
+                 plan_hint: str = "", review_retry: bool = False) -> None:
         trace = res.trace_id
         hint = plan_hint
         if not self.ctx.use_peek:
@@ -384,6 +409,29 @@ class DataAgent:
         log_event(trace, "generate",
                   ms=round((time.perf_counter() - started) * 1000),
                   **trace_fields({"route": "sql", "statement": sql, **peek_update}))
+
+        # 结构审查（P1）：block 的语句不执行，把审查意见回喂再写一次；
+        # 线性引擎只有这一轮重试（状态机那边由 reflect 的通用重试环负责）。
+        if self.ctx.use_review:
+            try:
+                review = review_sql(sql, self.ctx.db_unique_keys)
+                res.review_issues = list(review["issues"])
+            except Exception:
+                review = {"ok": True, "issues": []}
+            if not review["ok"]:
+                feedback = format_review_for_model(review["issues"])
+                res.errors.append(feedback)
+                log_event(trace, "generate", ms=0,
+                          **trace_fields({"route": "sql", "error": feedback},
+                                         failed=True, review_blocked=True))
+                if not review_retry:
+                    return self._try_sql(
+                        question, res, terms=terms,
+                        plan_hint=(plan_hint + "\n\n" + feedback).strip()
+                        if plan_hint else feedback,
+                        review_retry=True)
+                res.review_blocked = True
+                return
 
         started = time.perf_counter()
         r = run_sql(sql, self.db_path)
