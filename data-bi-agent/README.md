@@ -16,7 +16,7 @@
 | 4 | Streamlit 网页界面 | ✅ |
 | 5 | 评测 / 安全加固 / 部署 | ✅ |
 | 6 | 命令行增强（子命令 / 子命令输出格式 / 会话续聊 / 追问建议） | ✅ |
-| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 相对时间锚点 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ 持续集成（GitHub Actions）/ 链路追踪（trace_id）/ 计划先行（先出计划再写 SQL）/ 两段式探查（先看一眼真实取值）/ 词典自动生成（接新库不用手抄 catalog）/ **MCP server（供别的 Agent 直接调用）** / **SQL 复用（同一个问题再问不调模型）** / **SQL 结构审查（拦笛卡尔积、提示结构风险）** | ✅ |
+| 改进 | 空结果自愈 / 聚合空识别 / 取值澄清 / 拒答与范围守卫 / 相对时间锚点 / 修正回流（teach、lessons）/ 指标归因（为什么变了）/ 持续集成（GitHub Actions）/ 链路追踪（trace_id）/ 计划先行（先出计划再写 SQL）/ 两段式探查（先看一眼真实取值）/ 词典自动生成（接新库不用手抄 catalog）/ **MCP server（供别的 Agent 直接调用）** / **MCP HTTP 传输（跨机器 + 令牌 + Host 白名单）** / **SQL 复用（同一个问题再问不调模型）** / **SQL 结构审查（拦笛卡尔积、提示结构风险）** | ✅ |
 
 ## 环境要求
 
@@ -375,7 +375,25 @@ AGENT_CATALOG=我的词典.yaml python -m app.cli ask "各渠道的销售额是�
 pip install -r requirements-mcp.txt
 python -m app.cli serve                              # stdio，默认用 data/sales.db
 python -m app.cli serve --db D:/data/我的库.db        # 指定默认库
+
+# streamable-http：默认只监听本机 http://127.0.0.1:8000/mcp
+python -m app.cli serve --transport streamable-http
+
+# 跨机器：令牌必填（至少 16 字符），建议放环境变量而不是 --token（避免进程列表泄露）
+set AGENT_MCP_TOKEN=换成一个够长的随机串
+python -m app.cli serve --transport streamable-http --host 0.0.0.0 --allowed-host 你的域名
 ```
+
+**HTTP 安全边界**：stdio 是"谁起进程谁就是用户"，HTTP 没有这层天然隔离，所以：
+
+| 规则 | 默认值 / 行为 |
+| --- | --- |
+| 监听地址 | `127.0.0.1`，非本机监听没有令牌直接拒绝启动 |
+| 令牌 | 非本机必须设 `AGENT_MCP_TOKEN` 或 `--token`（≥16 字符）；用 `Authorization: Bearer <token>`，常量时间比较，401 不回显令牌 |
+| Host 白名单 | 本机地址始终放行；其他域名用 `--allowed-host` 或 `AGENT_MCP_ALLOWED_HOSTS` 加（挡 DNS rebinding） |
+| 写操作 | 非本机默认只读：工具列表里没有 `generate_catalog`，`ask(chart=true)` 拒绝；要放开加 `--allow-write` |
+
+客户端连接本机 HTTP 时只需把 URL 配成 `http://127.0.0.1:8000/mcp`；跨机器还要带 Bearer 头。
 
 在 Claude Desktop 的 `claude_desktop_config.json` 里加一段（路径换成你自己的）：
 
@@ -398,6 +416,16 @@ python -m app.cli serve --db D:/data/我的库.db        # 指定默认库
 | `ask` | 用中文问一个数据问题，返回结果数据 + 生成的 SQL + 执行信息 | `ask -f json` |
 | `get_schema` | 看有哪些表/列（含中文名）、指标口径、表关系 | `schema --json` |
 | `generate_catalog` | 给陌生的库生成词典草稿（**会写文件**，需人工确认） | `catalog` |
+
+`serve` 专属参数（stdio 下只有 `--db` / `--name` 生效）：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--transport {stdio,streamable-http}` | 传输方式，默认 stdio |
+| `--host` / `--port` / `--path` | HTTP 监听地址 / 端口 / 端点路径（默认 `127.0.0.1` / `8000` / `/mcp`） |
+| `--token` | Bearer 令牌；建议改设 `AGENT_MCP_TOKEN` |
+| `--allowed-host HOST` | Host 白名单，可重复或逗号分隔；对应 `AGENT_MCP_ALLOWED_HOSTS` |
+| `--allow-write` | 非本机 HTTP 显式放开写盘工具（默认只读） |
 
 `ask` 的参数：`question`（必填）、`db`、`plan` / `peek`（默认开，两项自检）、
 `insight` / `chart`（默认关，一个多花 token 一个写图片文件）、`linear`、
@@ -508,7 +536,7 @@ app/
 ├── agent.py             # 线性编排（--linear 时使用，也写阶段日志）
 ├── cli.py               # 命令行入口（子命令 ask / chat / schema / logs / teach / lessons / catalog / serve / version）
 ├── payload.py           # 结构化输出：CLI 的 -f json 与 MCP 工具共用同一份 payload
-├── mcp_server.py        # MCP server：把 ask / get_schema / generate_catalog 暴露给别的 Agent
+├── mcp_server.py        # MCP server：stdio + streamable-http 双传输，令牌/Host 鉴权，暴露 ask / get_schema / generate_catalog
 ├── render.py            # 结果渲染与导出（table / markdown / csv / json / xlsx）
 ├── sessions.py          # 会话持久化（~/.data-agent/sessions，支持 chat -c 续聊）
 ├── main.py              # Streamlit 网页界面（聊天式问答）
@@ -560,7 +588,7 @@ tests/
 ├── test_plan.py         # 计划先行测试（42 个用例：触发判定、JSON 解析、表/列/时间/取值/半年校验、两引擎）
 ├── test_peek.py         # 两段式探查测试（55 个用例：前缀解析、白名单正反例、回灌格式、额度、两引擎）
 ├── test_catalog_gen.py  # 词典自动生成测试（48 个用例：类型映射、枚举判据、外键推断、YAML 往返、激活 enum_guard）
-├── test_mcp_server.py   # MCP 测试（33 个用例：工具注册与参数 schema、截断标注、错误结构化、stdout 洁净、未装 mcp 的提示）
+├── test_mcp_server.py   # MCP 测试（52 个用例：工具注册与参数 schema、截断标注、错误结构化、stdout 洁净、HTTP 配置/鉴权中间件/CLI 透传、非 ASCII 令牌、未装 mcp 的提示）
 ├── test_prompt_budget.py # 提示词预算测试（15 个用例：schema 只注入一次、模板不许写回 {schema}、新写法必须省 40% 以上）
 ├── test_sql_cache.py    # SQL 复用测试（32 个用例：键与隔离、七条不复用规则、结果指纹、过时 SQL 作废、两引擎）
 ├── test_sql_review.py   # 结构审查测试（25 个用例：三类问题分级、误报反例、金标准回归、两引擎接入）
@@ -856,6 +884,11 @@ $ python -m app.cli ask "各区域的销售额是多少？"       # 第二次
 | `AGENT_TODAY` | 运行当天 | 相对时间的参考日（`YYYY-MM-DD`） | 历史回放、评测、复现「上个月」 |
 | `AGENT_CACHE` | 开启 | 设 `0` 关闭 SQL 复用（等同 `--no-cache`） | 批量跑评测、怀疑缓存时 |
 | `AGENT_SQL_REVIEW` | 开启 | 设 `0` 关闭 SQL 结构审查（等同 `--no-review`） | 排查审查误报、对比旧行为时 |
+| `AGENT_MCP_HOST` | `127.0.0.1` | MCP HTTP 监听地址（非本机必须设令牌） | 跨机器接入时 |
+| `AGENT_MCP_PORT` | `8000` | MCP HTTP 端口 | 端口冲突时 |
+| `AGENT_MCP_PATH` | `/mcp` | MCP 端点路径 | 反代路径不是 `/mcp` 时 |
+| `AGENT_MCP_TOKEN` | 空 | HTTP Bearer 令牌，非本机必填且 ≥16 字符 | 跨机器接入（优先于 `--token`，不进进程列表） |
+| `AGENT_MCP_ALLOWED_HOSTS` | 空 | HTTP Host 白名单，逗号分隔 | 反代/局域网用域名访问时 |
 | `AGENT_HOME` | `~/.data-agent` | 会话 / 缓存 / 修正记录的根目录 | 想隔离多套环境时 |
 | `AGENT_CATALOG` | `app/schema/catalog.yaml` | 业务术语词典路径 | 接自己的库时 |
 | `AGENT_MAX_QUESTION_CHARS` | `2000` | 单次提问字符上限 | 需要贴长文本时 |
@@ -877,7 +910,7 @@ $ python -m app.cli ask "各区域的销售额是多少？"       # 第二次
 python -m unittest discover -s tests -v
 ```
 
-共 617 个用例，覆盖：
+共 636 个用例，覆盖：
 
 | 测试文件 | 内容 |
 | --- | --- |
@@ -894,7 +927,7 @@ python -m unittest discover -s tests -v
 | `tests/test_deploy.py` | 密钥读取优先级（env → .env → st.secrets）、配置总闸（没 Key / 占位 Key 都必须拦住）、容器文件与忽略规则、Streamlit 配置解析 |
 | `tests/test_cli.py` | 旧命令兼容、四种输出格式、导出 csv/json/md/xlsx、会话存取与坏文件容错、日志读取、`logs --trace` 参数、追问建议、退出码 |
 | `tests/test_trace.py` | 追踪号格式与同秒不撞号、阶段事件不混入汇总行、完整号/前缀/尾号三级匹配与多链提示、状态机的重试环与澄清分支、线性路线的顺利/回退/全失败三条链、节点异常留痕、字段白名单（只记长度/行数、零值不写、未知键丢弃）、CLI 链路输出 |
-| `tests/test_mcp_server.py` | MCP 工具注册与参数 schema（默认值要落在省 token 那一档）、`ask` 的开关映射（`plan=False` 真的落成 `--no-plan`）、截断标注（`rows` 是真实总数、`data` 只有 N 行、`truncated` 为真）、中文不转义、空问题/库不存在/模型异常的三种结构化错误、`dry_run` 绝不调模型、草稿落到库文件同目录且能被 `yaml.safe_load` 读回、**工具调用期间 stdout 必须为空**（stdio 协议通道）、未装 mcp 时的提示语、`serve --db/--name` 真的传下去 |
+| `tests/test_mcp_server.py` | MCP 工具注册与参数 schema（默认值要落在省 token 那一档）、`ask` 的开关映射（`plan=False` 真的落成 `--no-plan`）、截断标注（`rows` 是真实总数、`data` 只有 N 行、`truncated` 为真）、中文不转义、空问题/库不存在/模型异常的三种结构化错误、`dry_run` 绝不调模型、草稿落到库文件同目录且能被 `yaml.safe_load` 读回、**工具调用期间 stdout 必须为空**（stdio 协议通道）、未装 mcp 时的提示语、`serve --db/--name` 真的传下去；HTTP 配置校验（默认本机、非本机强制令牌、端口/路径边界）、ASGI 级 Bearer 与 Host 白名单（401/403 结构化、令牌不回显）、`--transport` 参数与环境变量透传、只读模式隐藏 `generate_catalog` 并拒绝 `chart=true`、uvicorn 收到正确 host/port |
 | `tests/test_prompt_budget.py` | 提示词预算：schema / 术语在整份 prompt 里只出现一次、示例消息里一次都没有、模板不许再写回 `{schema}` / `{terms}`、新写法必须比老写法短 40% 以上（把占位符改回去会红光） |
 | `tests/test_catalog_gen.py` | 词典自动生成：类型映射（含"TEXT 存日期"与"没声明类型"）、枚举四条判据与标识符排除（回归 `customer_id` 误认）、外键声明与推断、脏 JSON 解析、不存在的表列被丢弃、三方合并优先级（已有 > 模型 > 实测，事实除外）、YAML 往返与特殊字符转义、参数超长拒绝、草稿喂给 `build_db_schema_text`、草稿激活 `enum_guard` |
 | `tests/test_peek.py` | 两段式探查：`PEEK:` 前缀（含全角冒号、大小写、二次探查）、白名单正反例（单表/纯列名放行，JOIN/UNION/子查询/聚合/`*`/多表/多语句全拒）、单列压成取值清单与多列按行回灌、空值与超长值、额度用完与死循环、探查失败原因回灌、两引擎端到端 |
@@ -986,6 +1019,9 @@ python -m evals.run_eval --with-lessons
 > **0.16.0（SQL 结构审查）同样不动提示词**：53/53、64 次调用、90,597 tokens
 > （与 90,557 差 0.04%，模型波动）。审查是纯函数，评测新增一条硬回归：
 > `tests/test_sql_review.py` 逐条审查评测集的金标准 SQL，任何一条被误报就红灯。
+>
+> **0.17.0（MCP HTTP 传输）依然不动提示词**：53/53、64 次调用、90,542 tokens
+> （与 90,597 差 -0.06%，模型波动）。改动只在服务暴露层，评测口径照旧。
 
 用途例覆盖十一类：总量指标（5）、维度汇总（7）、排名 Top-N（5）、条件筛选（6）、业务口径（4）、
 时间趋势（3）、复杂推理（8，含环比增长率、分组 Top-1、周末对比）、多轮追问（3）、口语表达（2）、
@@ -1063,8 +1099,8 @@ streamlit run app/main.py
 - **词典描述自动生成**（XiYan-SQL 的 `DBDescGen`）：只借"接新库自动出描述"这个目标，
   分工反着来 —— 代码实测事实、模型只补语义、人拍板（见 `catalog` 小节）
 - **对外协议**（Model Context Protocol）：把 `ask` / `get_schema` / `generate_catalog` 包成
-  stdio server，别的 Agent 可直接调用。借的是协议本身，工具边界（只读、截断、结构化错误）
-  是按"返回值会进另一个模型的上下文"这条约束重新划的
+  stdio / streamable-http server，别的 Agent 可直接调用。借的是协议本身，工具边界（只读、截断、
+  结构化错误）是按"返回值会进另一个模型的上下文"这条约束重新划的；HTTP 另加令牌与 Host 边界
 - **命令行形态**（natural-sql / nlsql / simonw-llm）：子命令结构、`--format` 多格式输出、
   `chat -c` 续聊、`logs` 查询运行记录、stdin 管道、语义化退出码
 

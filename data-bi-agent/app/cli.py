@@ -17,6 +17,7 @@
     python -m app.cli lessons              # 查看 / 删除已沉淀的修正记录
     python -m app.cli catalog --db 我的库.db          # 给陌生的库自动生成语义词典草稿
     python -m app.cli catalog --db 我的库.db --dry-run  # 只看代码能自动认出什么（零成本）
+    python -m app.cli serve --transport streamable-http --port 8000  # HTTP（本机）
 
 设计取舍（借鉴来源见 docs/参考项目记录.md 第 7–9 节）：
 - **只用标准库 argparse**：项目已经带了 LangChain 一大串依赖，CLI 层不再引入
@@ -81,12 +82,13 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 """与项目阶段对齐：0.10 = 计划先行；0.11 = 两段式探查；0.12 = 词典描述自动生成；
 0.13 = MCP server（把 ask / schema / catalog 暴露给别的 Agent）；
 0.13.1 = 半年（上半年 / H1）纳入范围守卫，并修掉「今年上半年」被当成全年的锚点误判；
 0.14 = 提示词去重：schema / 术语只注入一次（输入 token -49.4%），行为不变；
-0.15 = 同问题复用历史 SQL（0 次模型调用）；0.16 = SQL 结构审查（笛卡尔积拦截 + 结构风险提示）。"""
+0.15 = 同问题复用历史 SQL（0 次模型调用）；0.16 = SQL 结构审查（笛卡尔积拦截 + 结构风险提示）；
+0.17 = MCP streamable-http 传输：本机默认、非本机强制令牌 + Host 白名单 + 只读默认。"""
 
 SUBCOMMANDS = ("ask", "a", "chat", "c", "schema", "s", "logs", "l",
                "teach", "t", "lessons", "ls", "catalog", "cat",
@@ -197,11 +199,27 @@ def build_parser() -> argparse.ArgumentParser:
     catalog_cmd.add_argument("--json", action="store_true", help="以 JSON 输出（不写文件）")
 
     serve_cmd = sub.add_parser(
-        "serve", help="以 MCP server 形态启动（stdio），供别的 Agent 直接调用")
+        "serve", help="以 MCP server 形态启动，供别的 Agent 直接调用")
     serve_cmd.add_argument("--db", metavar="PATH",
                            help="默认库文件；MCP 工具的参数里仍可逐次覆盖")
     serve_cmd.add_argument("--name", default="", metavar="NAME",
                            help="服务器名（默认 data-bi-agent）")
+    serve_cmd.add_argument("--transport", choices=("stdio", "streamable-http"),
+                           default="stdio",
+                           help="stdio（默认，本机进程）/ streamable-http（跨机器）")
+    serve_cmd.add_argument("--host", metavar="HOST", default=None,
+                           help="HTTP 监听地址（默认 127.0.0.1；非本机必须设令牌）")
+    serve_cmd.add_argument("--port", type=int, metavar="PORT", default=None,
+                           help="HTTP 端口（默认 8000）")
+    serve_cmd.add_argument("--path", metavar="PATH", default=None,
+                           help="MCP 端点路径（默认 /mcp）")
+    serve_cmd.add_argument("--token", metavar="TOKEN", default=None,
+                           help="Bearer 令牌；建议改用环境变量 AGENT_MCP_TOKEN")
+    serve_cmd.add_argument("--allowed-host", action="append", default=[],
+                           metavar="HOST", help="HTTP Host 白名单，可重复；也支持逗号分隔")
+    serve_cmd.add_argument("--allow-write", action="store_true",
+                           help="HTTP 下允许 generate_catalog 写草稿与 chart=true 写图片"
+                                "（非本机默认只读）")
 
     sub.add_parser("version", help="显示版本与当前数据源")
 
@@ -877,19 +895,44 @@ def run_catalog(args) -> int:
 
 
 def run_serve(args) -> int:
-    """以 MCP server 形态启动（stdio）。
+    """以 MCP server 形态启动（stdio 或 streamable-http）。
 
-    **这里不能 print 任何东西**：stdio 传输下 stdout 归 JSON-RPC 协议所有，
-    多一行提示就握手失败。需要提示时一律走 stderr。
+    **stdio 下不能 print 任何东西**：stdout 归 JSON-RPC 协议所有，多一行提示就
+    握手失败；HTTP 下 stdout 归 uvicorn，但启动错误仍统一走 stderr。
     延迟导入也是刻意的 —— mcp 是可选依赖，不能让其他命令因为没装它而 import 失败。
     """
     try:
-        from app.mcp_server import SERVER_NAME, serve
+        from app.mcp_server import (
+            DEFAULT_HTTP_HOST, DEFAULT_HTTP_PATH, DEFAULT_HTTP_PORT,
+            SERVER_NAME, serve,
+        )
     except ModuleNotFoundError as e:
         print(f"[启动失败] {e}", file=sys.stderr)
         return EXIT_FAILED
-    return serve(db=getattr(args, "db", "") or "",
-                 name=getattr(args, "name", "") or SERVER_NAME)
+
+    kwargs = {"db": getattr(args, "db", "") or "",
+              "name": getattr(args, "name", "") or SERVER_NAME}
+    transport = getattr(args, "transport", "stdio") or "stdio"
+    if transport == "streamable-http":
+        allowed = list(getattr(args, "allowed_host", None) or [])
+        env_hosts = os.environ.get("AGENT_MCP_ALLOWED_HOSTS", "")
+        if env_hosts:
+            allowed.extend(env_hosts.split(","))
+        raw_port = getattr(args, "port", None)
+        kwargs.update(
+            transport=transport,
+            host=getattr(args, "host", None) or os.environ.get(
+                "AGENT_MCP_HOST", DEFAULT_HTTP_HOST),
+            port=raw_port if raw_port is not None else os.environ.get(
+                "AGENT_MCP_PORT", DEFAULT_HTTP_PORT),
+            path=getattr(args, "path", None) or os.environ.get(
+                "AGENT_MCP_PATH", DEFAULT_HTTP_PATH),
+            token=(getattr(args, "token", None) if getattr(args, "token", None) is not None
+                   else os.environ.get("AGENT_MCP_TOKEN", "")),
+            allowed_hosts=allowed,
+            allow_write=bool(getattr(args, "allow_write", False)),
+        )
+    return serve(**kwargs)
 
 
 def run_version() -> int:

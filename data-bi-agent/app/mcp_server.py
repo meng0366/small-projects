@@ -18,9 +18,17 @@
    pywin32 一堆东西），所以只在 `build_server()` 里延迟导入；纯函数
    `ask_tool` / `schema_tool` / `catalog_tool` 不依赖 mcp，可以离线测。
 
-版本兼容：mcp 1.x 叫 `FastMCP`，2.x 改名 `MCPServer`，两者的 `tool()` 装饰器与
-`run(transport)` 签名一致，所以只做一层取类的薄兼容，不复制两套实现。
+版本兼容：mcp 1.x 叫 `FastMCP`，2.x 改名 `MCPServer`。`tool()` 一致，但 HTTP
+配置的位置变了（1.x 在构造函数、2.x 在 `run()` / `streamable_http_app()`），
+所以用一层「只传目标版本认识的参数」的薄兼容，不复制两套实现。
+
+0.17 加 HTTP 传输时守住一条线：stdio 是本机进程，谁起谁就是用户；HTTP 一旦
+跨机器就不再有这层天然边界。因此默认只绑 127.0.0.1，非本机监听强制 Bearer
+令牌（至少 16 字符）与 Host 白名单，且默认不注册会写盘的 `generate_catalog`。
 """
+import hmac
+import inspect
+import ipaddress
 import os
 import sys
 import time
@@ -45,6 +53,12 @@ SERVER_NAME = "data-bi-agent"
 MAX_ROWS_DEFAULT = 200
 """单次返回的行数上限。200 行足够看清分布，又不至于把对面的上下文塞满。"""
 
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8000
+DEFAULT_HTTP_PATH = "/mcp"
+MIN_REMOTE_TOKEN_LEN = 16
+"""非本机监听的令牌下限：短到能被猜出来的 token 等于没设。"""
+
 INSTRUCTIONS = """\
 这是「数据分析 Agent」：用中文自然语言提问，它把问题翻译成 SQL 在只读库上执行，
 返回结果数据、生成的语句与一句中文结论。
@@ -56,6 +70,132 @@ INSTRUCTIONS = """\
 
 返回都是 JSON。`data` 可能被截断，看 `truncated` 与 `rows`；`ok=false` 时看 `error`。
 """
+
+
+# ---------------------------------------------------------------- HTTP 边界（纯函数，可离线测）
+def _host_only(value: str) -> str:
+    """把 ``example.com:8000`` / ``[::1]:8000`` 归一成裸主机名。"""
+    text = (value or "").strip()
+    if text.startswith("["):
+        return text[1:].split("]", 1)[0].strip().lower()
+    if text.count(":") == 1:
+        return text.rsplit(":", 1)[0].strip().lower()
+    return text.lower()
+
+
+def _is_loopback(host: str) -> bool:
+    name = _host_only(host)
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def normalize_http_config(host: str = DEFAULT_HTTP_HOST,
+                          port: int = DEFAULT_HTTP_PORT,
+                          path: str = DEFAULT_HTTP_PATH, token: str = "",
+                          allowed_hosts=(), allow_write: bool = False) -> dict:
+    """校验并归一 HTTP 启动参数；不合法时抛 ValueError（由 serve 打到 stderr）。
+
+    安全默认：本机绑定、非本机必须带够长的令牌；本机也校验 Host 头，
+    挡住 DNS rebinding（浏览器把 127.0.0.1 当成自己内网的一块跳板）。
+    """
+    host = str(host or DEFAULT_HTTP_HOST).strip()
+    if not host or any(ch.isspace() for ch in host):
+        raise ValueError("--host 不能为空或包含空格。")
+    try:
+        port = int(port)
+    except (TypeError, ValueError) as e:
+        raise ValueError("--port 必须是 1–65535 的整数。") from e
+    if not 1 <= port <= 65535:
+        raise ValueError(f"--port 超出范围：{port}（要是 1–65535）。")
+    path = str(path or DEFAULT_HTTP_PATH).strip()
+    if not path.startswith("/") or any(ch.isspace() for ch in path):
+        raise ValueError("--path 必须以 / 开头且不能含空格（如 /mcp）。")
+
+    token = (token or "").strip()
+    remote = not _is_loopback(host)
+    if remote and len(token) < MIN_REMOTE_TOKEN_LEN:
+        raise ValueError(
+            f"非本机监听（--host {host}）必须设置至少 {MIN_REMOTE_TOKEN_LEN} 字符的"
+            " Bearer 令牌：--token 或环境变量 AGENT_MCP_TOKEN。"
+            " 只监听 127.0.0.1 可不带令牌。"
+        )
+
+    hosts = {"localhost", "127.0.0.1", "::1", _host_only(host)}
+    for item in allowed_hosts or []:
+        for part in str(item).split(","):
+            if part.strip():
+                hosts.add(_host_only(part))
+    hosts.discard("")
+    return {
+        "host": host, "port": port, "path": path, "token": token,
+        "allowed_hosts": frozenset(hosts), "remote": remote,
+        # 跨机器默认只读：generate_catalog 会写文件，chart=true 也会落图片。
+        "read_only": remote and not allow_write,
+    }
+
+
+async def _send_http_error(send, status: int, message: str,
+                           extra_headers=()) -> None:
+    """鉴权失败也返回结构化 JSON，跟工具错误保持一种形状。"""
+    body = dumps({"ok": False, "error": message}).encode("utf-8")
+    headers = [(b"content-type", b"application/json; charset=utf-8"),
+               *extra_headers]
+    await send({"type": "http.response.start", "status": status,
+                "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+def guard_http_app(app, *, token: str = "", allowed_hosts=()):
+    """给 MCP 的 ASGI app 套上 Bearer 令牌与 Host 白名单。
+
+    mcp SDK 自带的 transport_security 在 1.x / 2.x 之间换过位置，自己包一层
+    ASGI 反而更稳；而且这样令牌校验是**所有请求之前**的第一道门，不会漏掉
+    `/mcp` 之外的路径。
+    """
+    expected = (token or "").strip()
+    allowed = frozenset(_host_only(h) for h in (allowed_hosts or ()))
+
+    async def guarded(scope, receive, send):
+        if scope.get("type") not in ("http", "websocket"):
+            await app(scope, receive, send)
+            return
+        headers = {
+            k.decode("latin-1").lower(): v.decode("utf-8", "replace")
+            for k, v in scope.get("headers", [])
+        }
+        if allowed:
+            incoming = _host_only(headers.get("host", ""))
+            if incoming not in allowed:
+                await _send_http_error(
+                    send, 403, f"Host 不被允许：{incoming or '(空)'}"
+                               "（启动时用 --allowed-host 添加）")
+                return
+        if expected:
+            scheme, _, supplied = headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                    supplied.strip().encode("utf-8"), expected.encode("utf-8")):
+                await _send_http_error(
+                    send, 401, "需要 Bearer 令牌（Authorization: Bearer <token>）",
+                    [(b"www-authenticate", b"Bearer")])
+                return
+        await app(scope, receive, send)
+
+    return guarded
+
+
+def _supported_kwargs(target, candidates: dict) -> dict:
+    """只传目标版本认识的参数——1.x / 2.x 的 HTTP 配置位置不同。"""
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        return candidates
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return candidates
+    return {k: v for k, v in candidates.items() if k in params}
 
 
 # ---------------------------------------------------------------- 工具实现（纯函数，不依赖 mcp）
@@ -218,10 +358,22 @@ def _server_class():
         ) from e
 
 
-def build_server(db: str = "", name: str = SERVER_NAME):
-    """构建 MCP server。`db` 作为默认库，工具参数里仍可逐次覆盖。"""
+def build_server(db: str = "", name: str = SERVER_NAME, *,
+                 read_only: bool = False, http_config: dict = None):
+    """构建 MCP server。`db` 作为默认库，工具参数里仍可逐次覆盖。
+
+    `read_only=True` 时不注册 `generate_catalog`，并拒绝 `ask(chart=True)` ——
+    跨机器访问没有本地进程那层天然边界，写盘工具要显式开启。
+    """
     Server = _server_class()
-    server = Server(name=name, instructions=INSTRUCTIONS)
+    options = {"name": name, "instructions": INSTRUCTIONS}
+    if http_config:
+        # 1.x 把 HTTP 参数放构造函数，2.x 放 streamable_http_app()；两边都不认识就忽略。
+        options.update(_supported_kwargs(Server, {
+            "streamable_http_path": http_config["path"],
+            "host": http_config["host"],
+        }))
+    server = Server(**options)
     default_db = db or ""
 
     def ask(question: str, db: str = default_db, plan: bool = True, peek: bool = True,
@@ -233,6 +385,9 @@ def build_server(db: str = "", name: str = SERVER_NAME):
         plan / peek 是"先出查询计划"与"先看一眼真实取值"两项自检，默认开启；
         想省钱可以关掉。chart / insight 默认关闭（它们会多花 token 或写图片文件）。
         """
+        if read_only and chart:
+            return _fail("当前是只读 MCP 服务：chart=true 会写图片文件，已拒绝。"
+                         " 如需生成图片，请用本机 stdio 启动，或显式 --allow-write。")
         return ask_tool(question, db=db, plan=plan, peek=peek,
                         insight=insight, chart=chart, linear=linear, max_rows=max_rows)
 
@@ -256,16 +411,55 @@ def build_server(db: str = "", name: str = SERVER_NAME):
 
     server.tool(name="ask", description=ask.__doc__)(ask)
     server.tool(name="get_schema", description=get_schema.__doc__)(get_schema)
-    server.tool(name="generate_catalog", description=generate_catalog.__doc__)(generate_catalog)
+    if not read_only:
+        server.tool(name="generate_catalog",
+                    description=generate_catalog.__doc__)(generate_catalog)
     return server
 
 
-def serve(db: str = "", name: str = SERVER_NAME) -> int:
-    """以 stdio 启动（Claude Desktop / IDE / 各类 MCP 客户端的标准形态）。"""
+def build_http_app(server, config: dict):
+    """把 MCP server 变成带鉴权的 ASGI app，供 uvicorn 直接跑。"""
+    factory = getattr(server, "streamable_http_app", None)
+    if not callable(factory):
+        raise RuntimeError(
+            "当前 mcp 版本没有 streamable_http_app()，请装 mcp>=1.9："
+            "pip install -r requirements-mcp.txt")
+    # 2.x 的 app builder 收 path/host；1.x 在构造时已经设过，这里过滤掉就好。
+    app = factory(**_supported_kwargs(factory, {
+        "streamable_http_path": config["path"],
+        "host": config["host"],
+    }))
+    return guard_http_app(app, token=config["token"],
+                          allowed_hosts=config["allowed_hosts"])
+
+
+def serve_http(server, config: dict) -> int:
+    """启动 streamable-http。uvicorn 是 mcp 的传递依赖，仍延迟导入。"""
+    import uvicorn                      # noqa: F401——只在真要起 HTTP 时才需要
+    app = build_http_app(server, config)
+    uvicorn.run(app, host=config["host"], port=config["port"],
+                log_level="warning", access_log=False)
+    return 0
+
+
+def serve(db: str = "", name: str = SERVER_NAME, *,
+          transport: str = "stdio", host: str = DEFAULT_HTTP_HOST,
+          port: int = DEFAULT_HTTP_PORT, path: str = DEFAULT_HTTP_PATH,
+          token: str = "", allowed_hosts=(), allow_write: bool = False) -> int:
+    """启动 MCP server：stdio（默认）或 streamable-http。"""
     try:
-        server = build_server(db=db, name=name)
-    except ModuleNotFoundError as e:
+        if transport == "stdio":
+            server = build_server(db=db, name=name)
+            server.run("stdio")
+            return 0
+        if transport != "streamable-http":
+            raise ValueError(f"未知传输方式：{transport}（只支持 stdio / streamable-http）")
+        config = normalize_http_config(host=host, port=port, path=path,
+                                       token=token, allowed_hosts=allowed_hosts,
+                                       allow_write=allow_write)
+        server = build_server(db=db, name=name, read_only=config["read_only"],
+                              http_config=config)
+        return serve_http(server, config)
+    except (ModuleNotFoundError, ValueError, RuntimeError) as e:
         print(f"[启动失败] {e}", file=sys.stderr)
         return 1
-    server.run("stdio")
-    return 0

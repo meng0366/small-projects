@@ -3,6 +3,56 @@
 面向协作方的同步文档：这次改了什么、行为和以前哪里不一样、需要做什么。
 按版本倒序排列。版本号与 `python -m app.cli version` 一致。
 
+## 0.17.0 — 2026-11-26
+
+**一句话**：MCP 除了 stdio 还能走 streamable-http，跨机器调用不再难；但默认只监听本机，
+跨机器必须带令牌、校验 Host，并且默认不暴露会写盘的工具。
+
+### 一、用户能感受到的变化
+
+- `python -m app.cli serve --transport streamable-http` 启动 HTTP 端点，默认
+  `http://127.0.0.1:8000/mcp`；原来的 `serve` 仍是 stdio，行为零变化。
+- 跨机器监听（`--host 0.0.0.0` 或局域网 IP）**必须先设 `AGENT_MCP_TOKEN`**
+  （至少 16 字符），否则直接启动失败并给出可执行提示。客户端用
+  `Authorization: Bearer <token>` 调用。
+- 每次请求先验 `Host` 白名单（挡 DNS rebinding）再验令牌；失败返回结构化 JSON
+  401/403，不回显令牌、不给 traceback。
+- 非本机 HTTP 默认**只读**：工具列表里没有 `generate_catalog`，`ask(chart=true)` 明确拒绝；
+  只有显式 `--allow-write` 才放开写盘。本机 stdio/HTTP 不受影响。
+
+### 二、新增参数与环境变量
+
+| CLI | 环境变量 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `--transport {stdio,streamable-http}` | — | `stdio` | 传输方式 |
+| `--host` | `AGENT_MCP_HOST` | `127.0.0.1` | 非本机需令牌 |
+| `--port` | `AGENT_MCP_PORT` | `8000` | — |
+| `--path` | `AGENT_MCP_PATH` | `/mcp` | 端点路径 |
+| `--token` | `AGENT_MCP_TOKEN` | 空 | 建议用环境变量，避免进程列表泄露 |
+| `--allowed-host` | `AGENT_MCP_ALLOWED_HOSTS` | 空 | 可重复 / 逗号分隔 |
+| `--allow-write` | — | 关 | 非本机 HTTP 放开写盘工具 |
+
+### 三、实现上的三个刻意选择
+
+- **只传目标版本认识的参数**：mcp 1.x 把 HTTP 配置放构造函数、2.x 放 `run()` /
+  `streamable_http_app()`，`_supported_kwargs()` 按签名过滤，不写两份 server 实现。
+- **鉴权包在 ASGI 最外层**：不依赖换过位置的 SDK `transport_security`，两个版本行为一致，
+  也不会漏掉 `/mcp` 之外的路径；`hmac.compare_digest` 比较令牌。
+- **uvicorn 延迟导入**：MCP 仍是可选项，没装 mcp / uvicorn 不影响 CLI、网页与测试。
+
+### 四、验证
+
+- 离线用例 617 → **636**（新增 19 个），全绿。
+- 评测 **53/53**、64 次调用、90,542 输入 tokens，与 0.16.0 的 90,597 持平（模型波动）。
+- 真实 HTTP 握手 `initialize → notifications/initialized → tools/list` 正常；
+  带令牌服务实测无令牌 401、错令牌 401、伪造 Host 403、正确令牌 200。
+
+### 五、同步清单
+
+1. `python -m unittest discover -s tests` 应为 **636 passed**；`python -m app.cli version` 为 `0.17.0`。
+2. 无新增必装依赖；`requirements-mcp.txt` 不变（uvicorn 随 mcp 安装）。
+3. stdio 的返回结构与工具参数不变；HTTP 只新增鉴权失败的结构化响应。
+
 ## 0.16.0 — 2026-11-26
 
 **一句话**：SQL 写出来了、也能跑，但结构本身可能把数字算错。执行前加一层纯代码

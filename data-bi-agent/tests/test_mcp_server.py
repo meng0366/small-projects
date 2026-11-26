@@ -16,20 +16,25 @@ import json
 import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import yaml
 
 from app import cli, payload as payload_mod
 from app.mcp_server import (
+    DEFAULT_HTTP_HOST, DEFAULT_HTTP_PATH, DEFAULT_HTTP_PORT,
     MAX_ROWS_DEFAULT,
     SERVER_NAME,
     ask_tool,
+    build_http_app,
     build_server,
     catalog_tool,
+    guard_http_app,
+    normalize_http_config,
     schema_tool,
     serve,
+    serve_http,
 )
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -362,6 +367,248 @@ class TestServeGuards(unittest.TestCase):
         cls = _server_class()
         for attr in ("tool", "run"):
             self.assertTrue(hasattr(cls, attr), attr)
+
+
+def _headers(host: str = "localhost:8000", auth: str = None):
+    pairs = [(b"host", host.encode("latin-1"))]
+    if auth is not None:
+        pairs.append((b"authorization", auth.encode("utf-8")))
+    return pairs
+
+
+def _run_asgi(app, headers=(), scope_type: str = "http"):
+    sent, called = [], []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": scope_type, "asgi": {"version": "3.0"},
+        "http_version": "1.1", "method": "POST", "scheme": "http",
+        "path": "/mcp", "raw_path": b"/mcp", "query_string": b"",
+        "headers": list(headers), "client": ("127.0.0.1", 1234),
+        "server": ("test", 8000),
+    }
+    asyncio.run(app(scope, receive, send))
+    return sent
+
+
+def _status(messages):
+    return next(m["status"] for m in messages if m["type"] == "http.response.start")
+
+
+def _body(messages):
+    return b"".join(m.get("body", b"") for m in messages
+                    if m["type"] == "http.response.body").decode("utf-8")
+
+
+class TestHttpConfig(unittest.TestCase):
+    def test_defaults_stay_on_loopback(self):
+        cfg = normalize_http_config()
+        self.assertEqual((cfg["host"], cfg["port"], cfg["path"]),
+                         (DEFAULT_HTTP_HOST, DEFAULT_HTTP_PORT, DEFAULT_HTTP_PATH))
+        self.assertFalse(cfg["remote"])
+        self.assertFalse(cfg["read_only"])
+        self.assertEqual(cfg["token"], "")
+        self.assertIn("localhost", cfg["allowed_hosts"])
+
+    def test_remote_without_token_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            normalize_http_config(host="0.0.0.0")
+        self.assertIn("AGENT_MCP_TOKEN", str(cm.exception))
+
+    def test_short_remote_token_is_refused(self):
+        with self.assertRaises(ValueError):
+            normalize_http_config(host="192.168.1.9", token="abc")
+
+    def test_remote_with_token_defaults_read_only(self):
+        cfg = normalize_http_config(host="0.0.0.0", token="s" * 20,
+                                    allowed_hosts=["mcp.internal:9000, [::1]:1"])
+        self.assertTrue(cfg["remote"])
+        self.assertTrue(cfg["read_only"])
+        self.assertIn("mcp.internal", cfg["allowed_hosts"])
+        self.assertIn("::1", cfg["allowed_hosts"])
+
+    def test_allow_write_turns_off_remote_read_only(self):
+        cfg = normalize_http_config(host="0.0.0.0", token="s" * 20,
+                                    allow_write=True)
+        self.assertFalse(cfg["read_only"])
+
+    def test_loopback_with_token_still_writes_by_default(self):
+        cfg = normalize_http_config(host="127.0.0.1", token="s" * 20)
+        self.assertFalse(cfg["remote"])
+        self.assertFalse(cfg["read_only"])
+
+    def test_bad_port_path_and_host(self):
+        for kwargs in ({"port": 0}, {"port": "x"}, {"path": "mcp"},
+                       {"path": "/mcp bad"}, {"host": "  "}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                normalize_http_config(**kwargs)
+
+
+class TestHttpGuard(unittest.TestCase):
+    def _fake_app(self, calls):
+        async def app(scope, receive, send):
+            calls.append(scope)
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": []})
+        return app
+
+    def test_host_whitelist_blocks_dns_rebinding(self):
+        calls = []
+        app = guard_http_app(self._fake_app(calls),
+                             allowed_hosts={"localhost", "127.0.0.1"})
+        self.assertEqual(_status(_run_asgi(app, _headers("localhost:8000"))), 200)
+        bad = _run_asgi(app, _headers("evil.example"))
+        self.assertEqual(_status(bad), 403)
+        self.assertIn("Host", _body(bad))
+        self.assertEqual(len(calls), 1)
+
+    def test_missing_or_wrong_bearer_returns_401_without_token_leak(self):
+        calls = []
+        token = "s" * 24
+        app = guard_http_app(self._fake_app(calls), token=token,
+                             allowed_hosts={"localhost"})
+        for auth in (None, "Basic abc", "Bearer wrong", f"bearer {token}x"):
+            with self.subTest(auth=auth):
+                sent = _run_asgi(app, _headers("localhost", auth))
+                self.assertEqual(_status(sent), 401)
+                self.assertNotIn(token, _body(sent))
+                start = next(m for m in sent if m["type"] == "http.response.start")
+                self.assertIn((b"www-authenticate", b"Bearer"), start["headers"])
+        self.assertEqual(calls, [])
+
+    def test_valid_bearer_passes_through(self):
+        calls = []
+        token = "s" * 24
+        app = guard_http_app(self._fake_app(calls), token=token,
+                             allowed_hosts={"localhost"})
+        sent = _run_asgi(app, _headers("localhost", f"Bearer {token}"))
+        self.assertEqual(_status(sent), 200)
+        self.assertEqual(len(calls), 1)
+
+    def test_unicode_token_is_compared_as_bytes(self):
+        """compare_digest 对 str 只收 ASCII；令牌里出现中文不该让服务 500。"""
+        calls = []
+        token = "令牌" * 10
+        app = guard_http_app(self._fake_app(calls), token=token,
+                             allowed_hosts={"localhost"})
+        self.assertEqual(_status(_run_asgi(
+            app, _headers("localhost", f"Bearer {token}"))), 200)
+        self.assertEqual(_status(_run_asgi(
+            app, _headers("localhost", "Bearer 错令牌"))), 401)
+        self.assertEqual(len(calls), 1)
+
+    def test_non_http_scope_is_untouched(self):
+        calls = []
+        app = guard_http_app(self._fake_app(calls), token="s" * 24)
+        _run_asgi(app, _headers("evil.example"), scope_type="lifespan")
+        self.assertEqual(len(calls), 1)
+
+    def test_build_http_app_wraps_sdk_app_and_filters_kwargs(self):
+        cfg = normalize_http_config(host="127.0.0.1", path="/rpc")
+
+        class FakeServer:
+            def __init__(self):
+                self.kwargs = None
+
+            def streamable_http_app(self, streamable_http_path=None):
+                self.kwargs = {"streamable_http_path": streamable_http_path}
+
+                async def app(scope, receive, send):
+                    await send({"type": "http.response.start", "status": 200,
+                                "headers": []})
+
+                return app
+
+        server = FakeServer()
+        app = build_http_app(server, cfg)
+        self.assertEqual(server.kwargs, {"streamable_http_path": "/rpc"})
+        self.assertEqual(_status(_run_asgi(app, _headers("localhost"))), 200)
+        self.assertEqual(_status(_run_asgi(app, _headers("evil.example"))), 403)
+
+    def test_serve_http_hands_app_to_uvicorn(self):
+        cfg = normalize_http_config(host="127.0.0.1", port=8123)
+
+        class FakeServer:
+            def streamable_http_app(self, **kwargs):
+                async def app(scope, receive, send):
+                    pass
+                return app
+
+        # 不假设测试环境装了 uvicorn：容器作业只装 requirements.txt。
+        fake_uvicorn = MagicMock()
+        with patch.dict("sys.modules", {"uvicorn": fake_uvicorn}):
+            self.assertEqual(serve_http(FakeServer(), cfg), 0)
+        self.assertEqual(fake_uvicorn.run.call_args.kwargs["host"], "127.0.0.1")
+        self.assertEqual(fake_uvicorn.run.call_args.kwargs["port"], 8123)
+
+
+class TestHttpServeDispatch(unittest.TestCase):
+    def test_http_serve_builds_read_only_server_and_config(self):
+        with patch("app.mcp_server.build_server") as build, \
+                patch("app.mcp_server.serve_http", return_value=0) as http:
+            code = serve(transport="streamable-http", host="0.0.0.0",
+                         token="s" * 20)
+        self.assertEqual(code, 0)
+        self.assertTrue(build.call_args.kwargs["read_only"])
+        self.assertTrue(http.call_args.args[1]["remote"])
+        self.assertNotIn("run", http.call_args.kwargs)
+
+    def test_unknown_transport_reports_on_stderr(self):
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = serve(transport="ftp")
+        self.assertEqual(code, 1)
+        self.assertIn("未知传输方式", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_cli_http_flags_reach_serve(self):
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return 0
+
+        argv = ["serve", "--transport", "streamable-http", "--host", "0.0.0.0",
+                "--port", "9000", "--path", "/rpc", "--token", "s" * 20,
+                "--allowed-host", "a.com,b.net", "--allow-write"]
+        with patch("app.mcp_server.serve", side_effect=fake):
+            self.assertEqual(cli.run_serve(cli.build_parser().parse_args(argv)), 0)
+        self.assertEqual(seen["transport"], "streamable-http")
+        self.assertEqual((seen["host"], seen["port"], seen["path"]),
+                         ("0.0.0.0", 9000, "/rpc"))
+        self.assertEqual(seen["allowed_hosts"], ["a.com,b.net"])
+        self.assertTrue(seen["allow_write"])
+
+    def test_cli_http_env_fallback(self):
+        seen = {}
+
+        def fake(**kwargs):
+            seen.update(kwargs)
+            return 0
+
+        env = {"AGENT_MCP_HOST": "localhost", "AGENT_MCP_PORT": "9111",
+               "AGENT_MCP_PATH": "/env-mcp", "AGENT_MCP_TOKEN": "e" * 20,
+               "AGENT_MCP_ALLOWED_HOSTS": "env.internal"}
+        with patch.dict(os.environ, env), patch("app.mcp_server.serve", side_effect=fake):
+            cli.run_serve(cli.build_parser().parse_args(
+                ["serve", "--transport", "streamable-http"]))
+        self.assertEqual((seen["host"], seen["port"], seen["path"]),
+                         ("localhost", "9111", "/env-mcp"))
+        self.assertEqual(seen["token"], "e" * 20)
+        self.assertEqual(seen["allowed_hosts"], ["env.internal"])
+
+    @unittest.skipUnless(HAS_MCP, NEEDS_MCP)
+    def test_read_only_server_hides_catalog_and_rejects_chart(self):
+        server = build_server(read_only=True)
+        self.assertEqual([t.name for t in asyncio.run(server.list_tools())],
+                         ["ask", "get_schema"])
+        result = asyncio.run(server.call_tool("ask", {"question": "q", "chart": True}))
+        self.assertIn("只读", str(result))
 
 
 class TestPayloadShared(unittest.TestCase):
